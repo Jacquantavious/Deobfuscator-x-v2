@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Deobfuscator-X v3 — 18-pass JavaScript deobfuscation engine, fully in-browser." />
+  <title>Deobfuscator-X v3</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔓</text></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- Monaco Editor CSS from CDN -->
+  <link rel="stylesheet" data-name="vs/editor/editor.main"
+    href="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/editor/editor.main.css" />
+</head>
+<body>
+
+  <!-- ═══════════════════════════════ HEADER ═══════════════════════════════ -->
+  <header class="app-header">
+    <div class="header-brand">
+      <span class="brand-icon">⬡</span>
+      <span class="brand-name">Deobfuscator<span class="brand-x">-X</span></span>
+      <span class="brand-version">v3.0</span>
+    </div>
+    <nav class="header-nav">
+      <span class="nav-stat" id="stat-lines">0 lines</span>
+      <span class="nav-sep">·</span>
+      <span class="nav-stat" id="stat-size">0 B</span>
+      <span class="nav-sep">·</span>
+      <span class="nav-stat" id="stat-passes">0 passes</span>
+    </nav>
+    <div class="header-actions">
+      <button class="btn-icon" id="btn-theme" title="Toggle Theme">◐</button>
+      <a class="btn-icon" href="https://github.com" target="_blank" rel="noopener" title="GitHub">⌥</a>
+    </div>
+  </header>
+
+  <!-- ════════════════════════════ MAIN LAYOUT ════════════════════════════ -->
+  <main class="app-main">
+
+    <!-- ─── TOOLBAR ─── -->
+    <div class="toolbar" role="toolbar">
+      <div class="toolbar-left">
+        <button class="btn btn-primary" id="btn-deobfuscate" title="Run deobfuscation (Ctrl+Enter)">
+          <span class="btn-icon-inner">▶</span> Deobfuscate
+        </button>
+        <button class="btn btn-secondary" id="btn-beautify" title="Beautify only">
+          <span class="btn-icon-inner">✦</span> Beautify Only
+        </button>
+        <button class="btn btn-ghost" id="btn-clear" title="Clear editors">
+          <span class="btn-icon-inner">✕</span> Clear
+        </button>
+        <button class="toolbar-batch-btn" id="btn-batch-toggle" title="Batch file processor">
+          📂 Batch
+        </button>
+      </div>
+      <div class="toolbar-right">
+        <button class="btn btn-ghost" id="btn-copy" disabled>
+          <span class="btn-icon-inner">⎘</span> Copy Output
+        </button>
+        <button class="btn btn-ghost" id="btn-download" disabled>
+          <span class="btn-icon-inner">↓</span> Download JS
+        </button>
+        <button class="btn btn-settings" id="btn-settings" aria-expanded="false" title="Settings (Ctrl+,)">
+          <span class="btn-icon-inner">⚙</span> Settings
+        </button>
+      </div>
+    </div>
+
+    <!-- ─── PROGRESS BAR ─── -->
+    <div class="progress-container" id="progress-container" aria-live="polite">
+      <div class="progress-track">
+        <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+        <div class="progress-shimmer"></div>
+      </div>
+      <span class="progress-label" id="progress-label">Idle</span>
+    </div>
+
+    <!-- ─── WORKSPACE ─── -->
+    <div class="workspace" id="workspace">
+
+      <!-- INPUT PANE -->
+      <section class="editor-pane" id="input-pane">
+        <div class="pane-header">
+          <div class="pane-title">
+            <span class="pane-dot pane-dot--input"></span>
+            Input <span class="pane-subtitle">obfuscated JavaScript · drop .js file here</span>
+          </div>
+          <div class="pane-meta" id="input-meta">Ready</div>
+        </div>
+        <div style="position:relative;flex:1;display:flex;flex-direction:column;min-height:0">
+          <div class="editor-container" id="input-editor-container"></div>
+          <div class="drop-hint" id="drop-hint">
+            <span class="drop-hint-icon">📂</span>
+            <span>Drop .js or .zip file here</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- RESIZE HANDLE -->
+      <div class="resize-handle" id="resize-handle" role="separator" aria-orientation="vertical" tabindex="0"></div>
+
+      <!-- OUTPUT PANE -->
+      <section class="editor-pane" id="output-pane">
+        <div class="pane-header">
+          <div class="pane-title">
+            <span class="pane-dot pane-dot--output"></span>
+            Output <span class="pane-subtitle">deobfuscated result</span>
+          </div>
+          <div class="pane-meta" id="output-meta">Waiting for input</div>
+        </div>
+        <div class="editor-container" id="output-editor-container"></div>
+      </section>
+
+    </div><!-- /.workspace -->
+
+    <!-- ─── ANALYSIS PANEL ─── -->
+    <div class="analysis-resize" id="analysis-resize" title="Drag to resize"></div>
+    <div class="analysis-panel" id="analysis-panel">
+      <div class="analysis-header">
+        <div class="analysis-tabs">
+          <button class="analysis-tab active" data-atab="log">Log</button>
+          <button class="analysis-tab" data-atab="passes">Pass Results</button>
+          <button class="analysis-tab" data-atab="diff">Diff</button>
+          <button class="analysis-tab" data-atab="tlog">Transform Log</button>
+          <button class="analysis-tab" data-atab="ast-tree">AST Tree</button>
+          <button class="analysis-tab" data-atab="batch">Batch</button>
+        </div>
+        <button class="console-clear-btn" id="btn-console-clear">Clear</button>
+      </div>
+      <div class="analysis-body" id="analysis-body">
+        <div class="analysis-pane active" id="atab-log"></div>
+        <div class="analysis-pane" id="atab-passes"></div>
+        <div class="analysis-pane" id="atab-diff"></div>
+        <div class="analysis-pane" id="atab-tlog"></div>
+        <div class="analysis-pane" id="atab-ast-tree"></div>
+        <div class="analysis-pane" id="atab-batch">
+          <div id="batch-panel-root"></div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ═══════════════════════════ SETTINGS PANEL ═══════════════════════════ -->
+  <aside class="settings-panel" id="settings-panel" aria-hidden="true">
+    <div class="settings-header">
+      <h2 class="settings-title">Transform Passes <span class="settings-section-badge">v3</span></h2>
+      <button class="settings-close" id="btn-settings-close">✕</button>
+    </div>
+    <div class="settings-body">
+
+      <div class="settings-section">
+        <h3 class="settings-section-title">String &amp; Literal Recovery</h3>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Runtime Pattern Detection <span class="settings-section-badge">NEW</span></span><span class="toggle-desc">Inline eval(string) / new Function() / setTimeout(string) statically</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="runtimePatterns" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">_0x Decoder Recovery</span><span class="toggle-desc">Inline _0x string arrays, simulate rotation, resolve all call sites</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="zeroXDecoder" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">String Array Cleanup</span><span class="toggle-desc">Inline large encoded string pools and remove the array</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="stringArrayCleanup" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">String Decoder Reconstruction</span><span class="toggle-desc">Resolve charCodeAt, nibble, and fromCharCode encodings</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="stringDecoder" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">XOR Decoding</span><span class="toggle-desc">Evaluate XOR byte arrays, charCodeAt XOR, repeating-key XOR</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="xorDecoding" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Template Literal Collapse <span class="settings-section-badge">NEW</span></span><span class="toggle-desc">Fold static template literals and 'a'+'b' string concatenation</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="templateLiteral" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Unicode Normalization</span><span class="toggle-desc">Convert \uXXXX escape sequences to readable characters</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="unicodeNormalization" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Hex Deobfuscation</span><span class="toggle-desc">Resolve 0x hex / 0o octal / 0b binary literals to decimal</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="hexDeobfuscation" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Property Access Normalization <span class="settings-section-badge">NEW</span></span><span class="toggle-desc">Convert obj['key'] bracket notation to obj.key dot notation</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="propertyAccessNorm" checked /><span class="toggle-switch"></span></div></label>
+      </div>
+
+      <div class="settings-section">
+        <h3 class="settings-section-title">Identifier Normalization</h3>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Homoglyph &amp; Unicode Cleanup</span><span class="toggle-desc">Remove invisible chars, normalize homoglyphs, rename to ASCII</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="homoglyphCleanup" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Scope-Aware Variable Rename <span class="settings-section-badge">NEW</span></span><span class="toggle-desc">Rename garbled _0x identifiers to readable _v0/_fn0 names per scope</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="scopeRename" /><span class="toggle-switch"></span></div></label>
+      </div>
+
+      <div class="settings-section">
+        <h3 class="settings-section-title">Numeric Simplification</h3>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Bitwise / Rotation Simplification</span><span class="toggle-desc">Fold constant &amp;, |, ^, &lt;&lt;, &gt;&gt;, rotl/rotr into readable values</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="bitwiseSimplify" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Numeric Literal Normalization</span><span class="toggle-desc">Convert scientific notation to plain decimals</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="numericLiteral" checked /><span class="toggle-switch"></span></div></label>
+      </div>
+
+      <div class="settings-section">
+        <h3 class="settings-section-title">Control Flow</h3>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Control Flow Reconstruction</span><span class="toggle-desc">Unpack while(true)+switch dispatcher loops into linear code</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="controlFlow" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Rotate Simplification</span><span class="toggle-desc">Remove push/shift array rotation IIFE boilerplate</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="rotateSimplifcation" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Comma Sequence Splitter <span class="settings-section-badge">NEW</span></span><span class="toggle-desc">Split (a(), b(), c()) comma chains into discrete statements</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="commaSplitter" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Ternary Unfold <span class="settings-section-badge">NEW</span></span><span class="toggle-desc">Convert deeply-nested ternary expressions to if/else chains</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="ternaryUnfold" checked /><span class="toggle-switch"></span></div></label>
+      </div>
+
+      <div class="settings-section">
+        <h3 class="settings-section-title">Dead Code &amp; Anti-Debug</h3>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Dead Code Removal</span><span class="toggle-desc">Eliminate if(false), unreachable branches, junk expressions</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="deadCode" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">AST Simplification</span><span class="toggle-desc">Constant folding, expression collapsing, opaque predicate removal</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="astSimplification" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Anti-Debugger Removal</span><span class="toggle-desc">Remove debugger statements and basic detection traps</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="antiDebugger" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Anti-Debugger Enhanced <span class="settings-section-badge">NEW</span></span><span class="toggle-desc">Remove console-disabling, timing traps, devtools detection, integrity checks</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-pass="antiDebuggerEnhanced" checked /><span class="toggle-switch"></span></div></label>
+      </div>
+
+      <div class="settings-section">
+        <h3 class="settings-section-title">Output Options</h3>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Add Pass Comments</span><span class="toggle-desc">Annotate output with transform provenance</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-option="addComments" checked /><span class="toggle-switch"></span></div></label>
+        <label class="toggle-row"><div class="toggle-info"><span class="toggle-name">Preserve Line Numbers</span><span class="toggle-desc">Keep original line mapping where possible</span></div><div class="toggle-control"><input type="checkbox" class="toggle-input" data-option="preserveLines" /><span class="toggle-switch"></span></div></label>
+      </div>
+
+    </div>
+    <div class="settings-footer">
+      <button class="btn btn-secondary btn-sm" id="btn-passes-reset">Reset to Defaults</button>
+      <span class="settings-footer-note">v3 · 18 passes · 7 new</span>
+    </div>
+  </aside>
+
+  <div class="settings-overlay" id="settings-overlay" aria-hidden="true"></div>
+
+  <!-- Monaco AMD loader from CDN -->
+  <script>var require = { paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } };</script>
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
