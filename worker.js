@@ -1168,16 +1168,712 @@ async function bootstrap() {
     },
   };
 
+  // ── Base64 / ROT / Caesar / multi-encoding string decoders ─────────────────
+  function tryBase64(s) { try { const d = atob(s); if (isPrintable(d)) return d; } catch(_) {} return null; }
+  function tryCaesar(s, shift) { let r = ''; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c >= 65 && c <= 90) r += String.fromCharCode(((c-65+shift)%26+26)%26+65); else if (c >= 97 && c <= 122) r += String.fromCharCode(((c-97+shift)%26+26)%26+97); else r += s[i]; } return r; }
+  function tryROT13(s) { return tryCaesar(s, 13); }
+  function tryArithBytes(s, op, val) {
+    try {
+      let r = '';
+      for (let i = 0; i < s.length; i++) {
+        let c = s.charCodeAt(i);
+        if (op === '+') c -= val; else if (op === '-') c += val; else if (op === '^') c ^= val;
+        if (c < 0 || c > 127) return null;
+        r += String.fromCharCode(c);
+      }
+      return isPrintable(r) ? r : null;
+    } catch(_) { return null; }
+  }
+  function tryRollingXor(bytes, seed) {
+    try {
+      let r = '', k = seed;
+      for (let i = 0; i < bytes.length; i++) { r += String.fromCharCode(bytes[i] ^ k); k = (k + bytes[i]) & 0xFF; }
+      return isPrintable(r) ? r : null;
+    } catch(_) { return null; }
+  }
+  function detectBase64Fn(fn) {
+    if (!fn?.body) return false;
+    const s = JSON.stringify(fn.body);
+    return (s.includes('atob') || (s.includes('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789') && s.includes('charCodeAt')));
+  }
+  function detectRC4Fn(fn) {
+    if (!fn?.body) return false;
+    const s = JSON.stringify(fn.body);
+    return s.includes('256') && s.includes('charCodeAt') && s.includes('^') && (s.includes('KSA') || (s.includes('S[') && s.includes('i++') && s.includes('j')));
+  }
+  function simpleRC4(key, ciphertext) {
+    try {
+      const S = Array.from({length:256},(_,i)=>i);
+      let j = 0;
+      for (let i = 0; i < 256; i++) { j=(j+S[i]+key.charCodeAt(i%key.length))%256; [S[i],S[j]]=[S[j],S[i]]; }
+      let i2=0, j2=0, r='';
+      for (let k=0; k<ciphertext.length; k++) {
+        i2=(i2+1)%256; j2=(j2+S[i2])%256; [S[i2],S[j2]]=[S[j2],S[i2]];
+        r+=String.fromCharCode(ciphertext.charCodeAt(k)^S[(S[i2]+S[j2])%256]);
+      }
+      return isPrintable(r)?r:null;
+    } catch(_){return null;}
+  }
+
+  const advancedStringDecoderPass = {
+    id: 'advancedStringDecoder', name: 'Advanced String Decoder (Base64/ROT/Caesar/RC4/Rolling-XOR)', priority: 8, enabled: true,
+    run(ast, { log }) {
+      let decoded = 0;
+      // Base64 inline: atob("...")
+      traverse(ast, {
+        CallExpression(path2) {
+          const { callee, arguments: args } = path2.node;
+          if (!t.isIdentifier(callee, { name: 'atob' }) && !(t.isMemberExpression(callee) && t.isIdentifier(callee.property, { name: 'atob' }))) return;
+          if (args.length !== 1 || !t.isStringLiteral(args[0])) return;
+          const r = tryBase64(args[0].value);
+          if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
+        },
+      });
+      // Detect and inline base64 wrapper functions
+      const b64Fns = new Map();
+      traverse(ast, {
+        FunctionDeclaration(path2) { if (detectBase64Fn(path2.node)) b64Fns.set(path2.node.id?.name, true); },
+        VariableDeclarator(path2) {
+          const init = path2.node.init;
+          if ((t.isFunctionExpression(init)||t.isArrowFunctionExpression(init)) && detectBase64Fn(init) && t.isIdentifier(path2.node.id)) b64Fns.set(path2.node.id.name, true);
+        },
+      });
+      if (b64Fns.size > 0) {
+        traverse(ast, {
+          CallExpression(path2) {
+            if (!t.isIdentifier(path2.node.callee) || !b64Fns.has(path2.node.callee.name)) return;
+            const args = path2.node.arguments;
+            if (args.length !== 1 || !t.isStringLiteral(args[0])) return;
+            const r = tryBase64(args[0].value);
+            if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
+          },
+        });
+      }
+      // ROT13 wrapper detection: function that calls .replace with /[A-Za-z]/g and charCode arithmetic
+      const rotFns = new Map();
+      traverse(ast, {
+        FunctionDeclaration(path2) {
+          const s = JSON.stringify(path2.node.body);
+          if (s.includes('charCodeAt') && (s.includes('13') || s.includes('ROT'))) rotFns.set(path2.node.id?.name, 13);
+        },
+        VariableDeclarator(path2) {
+          const init = path2.node.init;
+          if (!t.isFunctionExpression(init) && !t.isArrowFunctionExpression(init)) return;
+          const s = JSON.stringify(init.body);
+          if (s.includes('charCodeAt') && (s.includes('13') || s.includes('ROT')) && t.isIdentifier(path2.node.id)) rotFns.set(path2.node.id.name, 13);
+        },
+      });
+      if (rotFns.size > 0) {
+        traverse(ast, {
+          CallExpression(path2) {
+            if (!t.isIdentifier(path2.node.callee) || !rotFns.has(path2.node.callee.name)) return;
+            const args = path2.node.arguments;
+            if (args.length !== 1 || !t.isStringLiteral(args[0])) return;
+            const r = tryROT13(args[0].value);
+            if (isPrintable(r)) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
+          },
+        });
+      }
+      // RC4 wrapper detection
+      const rc4Fns = new Map();
+      traverse(ast, {
+        FunctionDeclaration(path2) { if (detectRC4Fn(path2.node) && path2.node.params.length >= 2) rc4Fns.set(path2.node.id?.name, true); },
+        VariableDeclarator(path2) {
+          const init = path2.node.init;
+          if (!t.isFunctionExpression(init) && !t.isArrowFunctionExpression(init)) return;
+          if (detectRC4Fn(init) && init.params.length >= 2 && t.isIdentifier(path2.node.id)) rc4Fns.set(path2.node.id.name, true);
+        },
+      });
+      if (rc4Fns.size > 0) {
+        traverse(ast, {
+          CallExpression(path2) {
+            if (!t.isIdentifier(path2.node.callee) || !rc4Fns.has(path2.node.callee.name)) return;
+            const args = path2.node.arguments;
+            if (args.length < 2 || !t.isStringLiteral(args[0]) || !t.isStringLiteral(args[1])) return;
+            const r = simpleRC4(args[0].value, args[1].value) ?? simpleRC4(args[1].value, args[0].value);
+            if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
+          },
+        });
+      }
+      // Arithmetic byte transforms: encoded strings passed through a known shift/XOR
+      traverse(ast, {
+        CallExpression(path2) {
+          const { callee, arguments: args } = path2.node;
+          // Pattern: arr.map(c => String.fromCharCode(c - N)).join('')
+          if (!t.isMemberExpression(callee) || !t.isIdentifier(callee.property, { name: 'join' })) return;
+          if (!args[0] || !t.isStringLiteral(args[0], { value: '' })) return;
+          const mapCall = callee.object;
+          if (!t.isCallExpression(mapCall) || !t.isMemberExpression(mapCall.callee) || !t.isIdentifier(mapCall.callee.property, { name: 'map' })) return;
+          const arr = mapCall.callee.object;
+          if (!t.isArrayExpression(arr)) return;
+          const bytes = arr.elements.map(e => t.isNumericLiteral(e) ? e.value : null);
+          if (bytes.some(b => b === null) || bytes.length === 0) return;
+          const mapFn = mapCall.arguments[0];
+          if (!mapFn || !mapFn.params || mapFn.params.length < 1) return;
+          const pn = mapFn.params[0]?.name;
+          if (!pn) return;
+          let body = mapFn.body;
+          let expr = t.isBlockStatement(body) ? extractReturnCall(body) : body;
+          if (!expr || !t.isCallExpression(expr) || !isFromCharCode(expr.callee) || expr.arguments.length !== 1) return;
+          const bArg = expr.arguments[0];
+          if (t.isBinaryExpression(bArg) && (bArg.operator === '+' || bArg.operator === '-')) {
+            const isLeftParam = t.isIdentifier(bArg.left) && bArg.left.name === pn;
+            const isRightLit = t.isNumericLiteral(bArg.right);
+            if (isLeftParam && isRightLit) {
+              const op = bArg.operator;
+              const val = bArg.right.value;
+              const r = tryArithBytes(String.fromCharCode(...bytes), op === '+' ? '-' : '+', val);
+              if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
+            }
+          }
+        },
+      });
+      if (decoded > 0) log('Advanced string decoder resolved ' + decoded + ' string(s)');
+      else log('No advanced encoded strings found');
+    },
+  };
+
+  // ── Constant Propagation ────────────────────────────────────────────────────
+  const constantPropagationPass = {
+    id: 'constantPropagation', name: 'Constant Propagation', priority: 18, enabled: true,
+    run(ast, { log }) {
+      let propagated = 0;
+      // Collect top-level const declarations with primitive literal initializers
+      const constMap = new Map();
+      traverse(ast, {
+        VariableDeclaration(path2) {
+          if (path2.node.kind !== 'const') return;
+          for (const decl of path2.node.declarations) {
+            if (!t.isIdentifier(decl.id) || !decl.init) continue;
+            const init = decl.init;
+            if (t.isStringLiteral(init) || t.isNumericLiteral(init) || t.isBooleanLiteral(init) || t.isNullLiteral(init)) {
+              constMap.set(decl.id.name, init);
+            }
+          }
+        },
+      });
+      if (constMap.size === 0) { log('No propagatable constants found'); return; }
+      // Replace reads of those consts with their literal values
+      traverse(ast, {
+        Identifier(path2) {
+          if (!constMap.has(path2.node.name)) return;
+          // Skip LHS of assignment/declaration and property keys
+          const parent = path2.parent;
+          if (t.isVariableDeclarator(parent) && parent.id === path2.node) return;
+          if (t.isAssignmentExpression(parent) && parent.left === path2.node) return;
+          if (t.isMemberExpression(parent) && !parent.computed && parent.property === path2.node) return;
+          if (t.isObjectProperty(parent) && parent.key === path2.node && !parent.computed) return;
+          if (t.isFunctionDeclaration(parent) || t.isClassDeclaration(parent)) return;
+          const lit = constMap.get(path2.node.name);
+          path2.replaceWith(t.cloneNode(lit));
+          propagated++;
+        },
+      });
+      if (propagated > 0) log('Propagated ' + propagated + ' constant(s)');
+      else log('No constant propagation opportunities found');
+    },
+  };
+
+  // ── Function Inliner ────────────────────────────────────────────────────────
+  const functionInlinerPass = {
+    id: 'functionInliner', name: 'Small Wrapper Function Inliner', priority: 35, enabled: true,
+    run(ast, { log }) {
+      let inlined = 0;
+      // Collect single-return wrapper functions: function f(a,b,...) { return <expr using only params>; }
+      const wrappers = new Map();
+      function collectWrapper(name, fn) {
+        if (!name || !fn?.params || !fn.body) return;
+        if (!t.isBlockStatement(fn.body) || fn.body.body.length !== 1) return;
+        const stmt = fn.body.body[0];
+        if (!t.isReturnStatement(stmt) || !stmt.argument) return;
+        const paramNames = fn.params.filter(p => t.isIdentifier(p)).map(p => p.name);
+        // Body must reference only params and safe literals — no outer scope refs to avoid capture bugs
+        let safe = true;
+        let refCount = 0;
+        try {
+          traverse({ type:'File', program:{ type:'Program', body:[t.expressionStatement(stmt.argument)], directives:[], sourceType:'script' } }, {
+            Identifier(ip) {
+              const n = ip.node.name;
+              if (!paramNames.includes(n) && !GLOBALS_SET.has(n)) { safe = false; ip.stop(); }
+              refCount++;
+            },
+          });
+        } catch(_) { safe = false; }
+        if (safe && paramNames.length <= 4 && refCount <= 20) wrappers.set(name, { params: paramNames, body: stmt.argument });
+      }
+      traverse(ast, {
+        FunctionDeclaration(path2) { collectWrapper(path2.node.id?.name, path2.node); },
+        VariableDeclarator(path2) {
+          const init = path2.node.init;
+          if ((t.isFunctionExpression(init)||t.isArrowFunctionExpression(init)) && t.isIdentifier(path2.node.id))
+            collectWrapper(path2.node.id.name, init);
+        },
+      });
+      if (wrappers.size === 0) { log('No inlinable wrapper functions found'); return; }
+      // Inline call sites
+      traverse(ast, {
+        CallExpression(path2) {
+          if (!t.isIdentifier(path2.node.callee)) return;
+          const w = wrappers.get(path2.node.callee.name);
+          if (!w) return;
+          const args = path2.node.arguments;
+          if (args.length !== w.params.length) return;
+          // Substitute params into body clone
+          let bodyClone = t.cloneNode(w.body, true);
+          // Simple substitution via a mini-traverse on a synthetic Program
+          const subst = new Map(w.params.map((p, i) => [p, args[i]]));
+          try {
+            traverse({ type:'File', program:{ type:'Program', body:[t.expressionStatement(bodyClone)], directives:[], sourceType:'script' } }, {
+              Identifier(ip) {
+                if (subst.has(ip.node.name) && !t.isMemberExpression(ip.parent)) ip.replaceWith(t.cloneNode(subst.get(ip.node.name), true));
+              },
+            });
+          } catch(_) { return; }
+          path2.replaceWith(bodyClone);
+          inlined++;
+        },
+      });
+      if (inlined > 0) log('Inlined ' + inlined + ' wrapper function call(s)');
+      else log('No wrapper function calls inlined');
+    },
+  };
+
+  // ── Object Alias Inliner ────────────────────────────────────────────────────
+  const objectAliasPass = {
+    id: 'objectAlias', name: 'Object Alias / Proxy Inliner', priority: 36, enabled: true,
+    run(ast, { log }) {
+      let inlined = 0;
+      // Detect: const obj = { a: fn1, b: fn2, ... } where all values are identifiers or literals
+      // Then replace obj.a(...) with fn1(...)
+      const aliasObjects = new Map();
+      traverse(ast, {
+        VariableDeclarator(path2) {
+          const { id, init } = path2.node;
+          if (!t.isIdentifier(id) || !t.isObjectExpression(init)) return;
+          const props = {};
+          let ok = true;
+          for (const prop of init.properties) {
+            if (!t.isObjectProperty(prop) || prop.computed || prop.shorthand) { ok = false; break; }
+            const key = t.isIdentifier(prop.key) ? prop.key.name : t.isStringLiteral(prop.key) ? prop.key.value : null;
+            if (!key) { ok = false; break; }
+            if (t.isIdentifier(prop.value) || t.isStringLiteral(prop.value) || t.isNumericLiteral(prop.value) || t.isBooleanLiteral(prop.value)) {
+              props[key] = prop.value;
+            } else { ok = false; break; }
+          }
+          if (ok && Object.keys(props).length > 0) aliasObjects.set(id.name, props);
+        },
+      });
+      if (aliasObjects.size === 0) { log('No alias objects found'); return; }
+      traverse(ast, {
+        MemberExpression(path2) {
+          if (path2.node.computed) return;
+          const obj = path2.node.object;
+          const prop = path2.node.property;
+          if (!t.isIdentifier(obj) || !t.isIdentifier(prop)) return;
+          const alias = aliasObjects.get(obj.name);
+          if (!alias || !(prop.name in alias)) return;
+          // Don't inline on LHS of assignment
+          if (t.isAssignmentExpression(path2.parent) && path2.parent.left === path2.node) return;
+          path2.replaceWith(t.cloneNode(alias[prop.name]));
+          inlined++;
+        },
+      });
+      if (inlined > 0) log('Inlined ' + inlined + ' alias object access(es)');
+      else log('No alias object accesses inlined');
+    },
+  };
+
+  // ── Unused Variable / Function Removal ─────────────────────────────────────
+  const unusedBindingsPass = {
+    id: 'unusedBindings', name: 'Unused Variable & Function Removal', priority: 50, enabled: true,
+    run(ast, { log }) {
+      let removed = 0;
+      // We need scope data — use traverse with scope
+      const toRemove = new Set();
+      traverse(ast, {
+        Program(path2) {
+          // Rebuild scope
+          path2.scope.crawl();
+        },
+        VariableDeclarator(path2) {
+          if (!t.isIdentifier(path2.node.id)) return;
+          const name = path2.node.id.name;
+          const binding = path2.scope.getBinding(name);
+          if (!binding) return;
+          if (binding.references === 0 && !binding.reassigned && path2.node.kind !== 'param') {
+            // Only remove if initializer is side-effect free
+            const init = path2.node.init;
+            if (!init || t.isLiteral(init) || t.isIdentifier(init) || t.isArrayExpression(init) || t.isObjectExpression(init)) {
+              toRemove.add(path2.node);
+            }
+          }
+        },
+        FunctionDeclaration(path2) {
+          const name = path2.node.id?.name;
+          if (!name) return;
+          const binding = path2.scope.getBinding(name);
+          if (binding && binding.references === 0) toRemove.add(path2.node);
+        },
+      });
+      traverse(ast, {
+        VariableDeclarator(path2) {
+          if (!toRemove.has(path2.node)) return;
+          const decl = path2.parentPath;
+          if (decl.node.declarations.length === 1) { decl.remove(); removed++; }
+          else { path2.remove(); removed++; }
+        },
+        FunctionDeclaration(path2) {
+          if (toRemove.has(path2.node)) { path2.remove(); removed++; }
+        },
+      });
+      if (removed > 0) log('Removed ' + removed + ' unused binding(s)');
+      else log('No unused bindings found');
+    },
+  };
+
+  // ── Opaque Predicate Removal ────────────────────────────────────────────────
+  const opaquePredicatePass = {
+    id: 'opaquePredicate', name: 'Opaque Predicate Removal', priority: 44, enabled: true,
+    run(ast, { log }) {
+      let removed = 0;
+      // Common opaque predicates in obfuscated JS:
+      // typeof window !== 'undefined', typeof module !== 'undefined', true === true, 0 === 0, etc.
+      function evalOpaque(node) {
+        if (!t.isBinaryExpression(node)) return null;
+        const { operator, left, right } = node;
+        // typeof X === 'string' / !== 'undefined' style — cannot fold without runtime
+        // But we CAN fold: literal op literal
+        if (t.isStringLiteral(left) && t.isStringLiteral(right)) {
+          const l = left.value, r = right.value;
+          switch(operator) { case '===': return l===r; case '!==': return l!==r; case '==': return l==r; case '!=': return l!=r; default: return null; } // eslint-disable-line eqeqeq
+        }
+        if (t.isNumericLiteral(left) && t.isNumericLiteral(right)) {
+          const l = left.value, r = right.value;
+          switch(operator) { case '===': return l===r; case '!==': return l!==r; case '>': return l>r; case '>=': return l>=r; case '<': return l<r; case '<=': return l<=r; default: return null; }
+        }
+        if (t.isBooleanLiteral(left) && t.isBooleanLiteral(right)) {
+          switch(operator) { case '===': return left.value===right.value; case '!==': return left.value!==right.value; default: return null; }
+        }
+        // !0 patterns already handled, but void 0 === undefined
+        if (t.isUnaryExpression(left,{operator:'void'}) && t.isIdentifier(right,{name:'undefined'})) return operator==='===' || operator==='==' ? true : null; // eslint-disable-line eqeqeq
+        return null;
+      }
+      traverse(ast, {
+        IfStatement: { exit(path2) {
+          const tv = evalOpaque(path2.node.test);
+          if (tv === null) return;
+          if (tv === true) {
+            if (t.isBlockStatement(path2.node.consequent)) path2.replaceWithMultiple(path2.node.consequent.body);
+            else path2.replaceWith(path2.node.consequent);
+          } else {
+            if (path2.node.alternate) {
+              if (t.isBlockStatement(path2.node.alternate)) path2.replaceWithMultiple(path2.node.alternate.body);
+              else path2.replaceWith(path2.node.alternate);
+            } else path2.remove();
+          }
+          removed++;
+        }},
+        ConditionalExpression: { exit(path2) {
+          const tv = evalOpaque(path2.node.test);
+          if (tv === null) return;
+          path2.replaceWith(tv ? path2.node.consequent : path2.node.alternate);
+          removed++;
+        }},
+        // !0 => true, !1 => false, !!0 => false, !!1 => true
+        UnaryExpression: { exit(path2) {
+          if (path2.node.operator === '!' && t.isNumericLiteral(path2.node.argument)) {
+            path2.replaceWith(t.booleanLiteral(!path2.node.argument.value)); removed++;
+          } else if (path2.node.operator === '!' && t.isBooleanLiteral(path2.node.argument)) {
+            path2.replaceWith(t.booleanLiteral(!path2.node.argument.value)); removed++;
+          } else if (path2.node.operator === 'void' && t.isNumericLiteral(path2.node.argument)) {
+            path2.replaceWith(t.identifier('undefined')); removed++;
+          }
+        }},
+      });
+      if (removed > 0) log('Removed ' + removed + ' opaque predicate(s)');
+      else log('No opaque predicates found');
+    },
+  };
+
+  // ── Iterative Fixed-Point Pipeline ─────────────────────────────────────────
+  const iterativeFixedPointPass = {
+    id: 'iterativeFixedPoint', name: 'Iterative Fixed-Point (multi-pass until stable)', priority: 95, enabled: true,
+    async run(ast, { log, signal }) {
+      const iterPasses = [
+        opaquePredicatePass, constantPropagationPass, templateLiteralPass,
+        bitwiseSimplifyPass, numericLiteralPass, deadCodePass, astSimplificationPass,
+        propertyAccessNormPass, objectAliasPass,
+      ];
+      let iteration = 0;
+      const MAX_ITER = 8;
+      while (iteration < MAX_ITER) {
+        if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+        iteration++;
+        let changed = false;
+        for (const pass of iterPasses) {
+          const before = (() => { try { return generate(ast, { concise: true }).code; } catch(_) { return ''; } })();
+          try { await pass.run(ast, { log: () => {}, signal }); } catch(_) {}
+          const after = (() => { try { return generate(ast, { concise: true }).code; } catch(_) { return ''; } })();
+          if (before !== after) changed = true;
+        }
+        if (!changed) break;
+      }
+      log('Fixed-point converged after ' + iteration + ' iteration(s)');
+    },
+  };
+
+  // ── Unicode Script Normalization (extended) ─────────────────────────────────
+  const extendedUnicodeNormPass = {
+    id: 'extendedUnicodeNorm', name: 'Extended Unicode Script Normalization', priority: 11, enabled: true,
+    run(ast, { log }) {
+      let count = 0;
+      // Extended homoglyph map: Coptic, Armenian, Syriac, Thaana, Mathematical alphabets, Fullwidth
+      const EXTENDED_MAP = {
+        // Fullwidth Latin
+        '\uFF21':'A','\uFF22':'B','\uFF23':'C','\uFF24':'D','\uFF25':'E','\uFF26':'F','\uFF27':'G','\uFF28':'H','\uFF29':'I','\uFF2A':'J','\uFF2B':'K','\uFF2C':'L','\uFF2D':'M','\uFF2E':'N','\uFF2F':'O','\uFF30':'P','\uFF31':'Q','\uFF32':'R','\uFF33':'S','\uFF34':'T','\uFF35':'U','\uFF36':'V','\uFF37':'W','\uFF38':'X','\uFF39':'Y','\uFF3A':'Z',
+        '\uFF41':'a','\uFF42':'b','\uFF43':'c','\uFF44':'d','\uFF45':'e','\uFF46':'f','\uFF47':'g','\uFF48':'h','\uFF49':'i','\uFF4A':'j','\uFF4B':'k','\uFF4C':'l','\uFF4D':'m','\uFF4E':'n','\uFF4F':'o','\uFF50':'p','\uFF51':'q','\uFF52':'r','\uFF53':'s','\uFF54':'t','\uFF55':'u','\uFF56':'v','\uFF57':'w','\uFF58':'x','\uFF59':'y','\uFF5A':'z',
+        // Mathematical bold/italic/script (sample range)
+        '\u{1D400}':'A','\u{1D401}':'B','\u{1D402}':'C','\u{1D403}':'D','\u{1D404}':'E',
+        '\u{1D41A}':'a','\u{1D41B}':'b','\u{1D41C}':'c','\u{1D41D}':'d','\u{1D41E}':'e',
+        // Modifier letters
+        '\u02B0':'h','\u02B2':'j','\u02B3':'r','\u02B7':'w','\u02B8':'y',
+        // Coptic (common homoglyphs)
+        '\u03E2':'S','\u03E3':'s','\u03E4':'F','\u03E5':'f',
+        // Armenian (selected)
+        '\u0531':'A','\u0532':'B','\u0535':'E','\u053F':'K',
+        // Cyrillic (augment existing map)
+        '\u0456':'i','\u0406':'I','\u0439':'u','\u0446':'c',
+      };
+      function extNormalize(name) {
+        let r = name.normalize('NFKD').replace(/[\u0300-\u036F\u1DC0-\u1DFF\u20D0-\u20FF]/g, '');
+        let out = '';
+        for (const ch of r) out += EXTENDED_MAP[ch] ?? normalizeStr(ch);
+        // Remove zero-width and invisible chars
+        out = out.replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD\uFE00-\uFE0F]/g, '');
+        // Strip non-ASCII that couldn't be mapped
+        out = out.replace(/[^\x00-\x7F]/g, '_');
+        return out;
+      }
+      traverse(ast, {
+        Identifier(path2) {
+          const name = path2.node.name;
+          if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name)) return; // already ASCII-safe
+          const normalized = extNormalize(name);
+          if (normalized === name || !normalized || !/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(normalized)) return;
+          try {
+            const binding = path2.scope?.getBinding(name);
+            if (binding) { path2.scope.rename(name, normalized); count++; }
+            else { path2.node.name = normalized; count++; }
+          } catch(_) {}
+        },
+      });
+      if (count > 0) log('Extended unicode normalization: renamed ' + count + ' identifier(s)');
+      else log('No extended unicode identifiers found');
+    },
+  };
+
+  // ── Semantic Rename (data-flow based) ──────────────────────────────────────
+  const semanticRenamePass = {
+    id: 'semanticRename', name: 'Semantic Variable Rename (data-flow)', priority: 91, enabled: false,
+    run(ast, { log }) {
+      let renamed = 0;
+      // Heuristics: infer name from: assigned string, called-function name, property access, typeof
+      function inferName(binding) {
+        if (!binding || !binding.path) return null;
+        const path2 = binding.path;
+        // From initializer
+        const init = path2.isVariableDeclarator() ? path2.node.init : null;
+        if (init) {
+          if (t.isStringLiteral(init)) return 'str_' + init.value.replace(/[^a-zA-Z0-9]/g,'_').slice(0,12);
+          if (t.isNumericLiteral(init)) return 'num_' + String(init.value).replace(/[^0-9]/g,'_');
+          if (t.isBooleanLiteral(init)) return init.value ? 'flagTrue' : 'flagFalse';
+          if (t.isNewExpression(init) && t.isIdentifier(init.callee)) return lcFirst(init.callee.name) + 'Inst';
+          if (t.isCallExpression(init) && t.isIdentifier(init.callee)) return lcFirst(init.callee.name) + 'Result';
+          if (t.isCallExpression(init) && t.isMemberExpression(init.callee) && t.isIdentifier(init.callee.property)) return lcFirst(init.callee.property.name) + 'Result';
+          if (t.isArrowFunctionExpression(init) || t.isFunctionExpression(init)) return 'fn_' + (path2.node.id?.name ?? 'anon');
+          if (t.isArrayExpression(init)) return 'arr';
+          if (t.isObjectExpression(init)) return 'obj';
+        }
+        // From references: if used as a callee, it's a fn
+        if (binding.referencePaths.some(r => t.isCallExpression(r.parent) && r.parent.callee === r.node)) return 'fn';
+        // From typeof check
+        if (binding.referencePaths.some(r => t.isUnaryExpression(r.parent) && r.parent.operator === 'typeof')) return 'val';
+        return null;
+      }
+      function lcFirst(s) { return s && s.length ? s[0].toLowerCase() + s.slice(1) : s; }
+      const renamedNames = new Set();
+      traverse(ast, {
+        Program(path2) { path2.scope.crawl(); },
+        'FunctionDeclaration|FunctionExpression|ArrowFunctionExpression|Program'(path2) {
+          const bindings = path2.scope?.bindings ?? {};
+          for (const [name, binding] of Object.entries(bindings)) {
+            if (!isGarbled(name)) continue;
+            const inferred = inferName(binding);
+            if (!inferred) continue;
+            // Make unique
+            let newName = inferred;
+            let idx = 0;
+            while (renamedNames.has(newName) || bindings[newName]) newName = inferred + '_' + (++idx);
+            renamedNames.add(newName);
+            try { path2.scope.rename(name, newName); renamed++; } catch(_) {}
+          }
+        },
+      });
+      if (renamed > 0) log('Semantic rename: renamed ' + renamed + ' identifier(s)');
+      else log('No garbled identifiers found for semantic rename');
+    },
+  };
+
+  // ── Switch Dispatcher Flatten (enhanced) ───────────────────────────────────
+  const switchDispatcherPass = {
+    id: 'switchDispatcher', name: 'Switch Dispatcher Flatten (enhanced)', priority: 23, enabled: true,
+    run(ast, { log }) {
+      let recovered = 0;
+      // Detect: switch on computed index into a string split by '|'
+      // var _order = "3|1|0|2".split('|'); switch(_order[counter++])
+      traverse(ast, {
+        WhileStatement(path2) {
+          const test = path2.node.test;
+          if (!(t.isBooleanLiteral(test,{value:true})||t.isNumericLiteral(test,{value:1}))) return;
+          const body = path2.node.body;
+          if (!t.isBlockStatement(body)) return;
+          for (const stmt of body.body) {
+            if (!t.isSwitchStatement(stmt)) continue;
+            const disc = stmt.discriminant;
+            // Pattern: arr[counter++] or arr[++counter]
+            let arrName = null;
+            if (t.isMemberExpression(disc) && t.isIdentifier(disc.object)) {
+              const prop = disc.property;
+              if (t.isUpdateExpression(prop) || (t.isBinaryExpression(prop))) arrName = disc.object.name;
+            }
+            if (!arrName) continue;
+            // Try to resolve the order array via resolveOrderArray
+            const orderArray = resolveOrderArray(path2, arrName);
+            if (!orderArray || orderArray.length === 0) continue;
+            const caseMap = new Map();
+            for (const c of stmt.cases) {
+              if (!c.test) continue;
+              const key = t.isStringLiteral(c.test) ? c.test.value : t.isNumericLiteral(c.test) ? String(c.test.value) : null;
+              if (key === null) continue;
+              caseMap.set(key, c.consequent.filter(s => !t.isContinueStatement(s) && !t.isBreakStatement(s)));
+            }
+            if (caseMap.size === 0) continue;
+            const result = [];
+            for (const key of orderArray) { const stmts = caseMap.get(key); if (stmts) result.push(...stmts); }
+            if (result.length > 0) { path2.replaceWithMultiple(result); recovered++; break; }
+          }
+        },
+        // Also handle for(;;) wrappers
+        ForStatement(path2) {
+          if (path2.node.init || path2.node.test || path2.node.update) return;
+          const body = path2.node.body;
+          if (!t.isBlockStatement(body)) return;
+          let sw = null;
+          for (const s of body.body) { if (t.isSwitchStatement(s)) { sw = s; break; } }
+          if (!sw || !t.isIdentifier(sw.discriminant)) return;
+          // Numeric state machine inside for(;;)
+          const stateVarName = sw.discriminant.name;
+          const stateMap = new Map();
+          let initialState = null;
+          const parentBody = path2.parentPath?.node?.body ?? [];
+          for (const s of (Array.isArray(parentBody) ? parentBody : parentBody?.body ?? [])) {
+            if (!t.isVariableDeclaration(s)) continue;
+            for (const d of s.declarations) {
+              if (t.isIdentifier(d.id) && d.id.name === stateVarName && t.isNumericLiteral(d.init)) { initialState = d.init.value; break; }
+            }
+          }
+          if (initialState === null) return;
+          for (const c of sw.cases) {
+            if (!c.test || !t.isNumericLiteral(c.test)) continue;
+            const stmts = [], pn = c.test.value; let nextState = null;
+            for (const stmt of c.consequent) {
+              if (t.isBreakStatement(stmt)||t.isContinueStatement(stmt)) continue;
+              if (t.isExpressionStatement(stmt)&&t.isAssignmentExpression(stmt.expression)&&t.isIdentifier(stmt.expression.left)&&stmt.expression.left.name===stateVarName&&t.isNumericLiteral(stmt.expression.right)){nextState=stmt.expression.right.value;continue;}
+              stmts.push(stmt);
+            }
+            stateMap.set(pn,{stmts,nextState});
+          }
+          if (stateMap.size === 0) return;
+          const result=[]; const visited=new Set(); let current=initialState;
+          while(current!==null&&stateMap.has(current)&&!visited.has(current)){
+            visited.add(current);const{stmts,nextState}=stateMap.get(current);result.push(...stmts);current=nextState;
+          }
+          if (result.length > 0) { path2.replaceWithMultiple(result); recovered++; }
+        },
+      });
+      if (recovered > 0) log('Enhanced dispatcher: recovered ' + recovered + ' block(s)');
+      else log('No dispatcher patterns found');
+    },
+  };
+
+  // ── Liveness / dead-assignment removal ─────────────────────────────────────
+  const deadAssignmentPass = {
+    id: 'deadAssignment', name: 'Dead Assignment Removal', priority: 49, enabled: true,
+    run(ast, { log }) {
+      let removed = 0;
+      traverse(ast, {
+        AssignmentExpression(path2) {
+          // var x = ...; x = ...; x = ...; — remove intermediate assignments never read
+          if (!t.isIdentifier(path2.node.left)) return;
+          const name = path2.node.left.name;
+          if (!path2.parentPath.isExpressionStatement()) return;
+          const binding = path2.scope.getBinding(name);
+          if (!binding || binding.references > 0 || binding.reassigned) return;
+          // If there are no reads and it's a simple assignment
+          const right = path2.node.right;
+          // Only remove if RHS is side-effect free
+          if (t.isLiteral(right) || t.isIdentifier(right)) {
+            path2.parentPath.remove(); removed++;
+          }
+        },
+      });
+      if (removed > 0) log('Removed ' + removed + ' dead assignment(s)');
+      else log('No dead assignments found');
+    },
+  };
+
+  // ── Junk Statement Removal ─────────────────────────────────────────────────
+  const junkStatementPass = {
+    id: 'junkStatement', name: 'Junk Statement Removal', priority: 48, enabled: true,
+    run(ast, { log }) {
+      let removed = 0;
+      traverse(ast, {
+        ExpressionStatement(path2) {
+          const expr = path2.node.expression;
+          // Standalone literals that do nothing
+          if (t.isStringLiteral(expr) && !path2.parentPath.isProgram() && !path2.parentPath.isBlockStatement()) return;
+          if (t.isStringLiteral(expr)) {
+            const val = expr.value;
+            if (val !== 'use strict' && val !== 'use client' && val !== 'use server') { path2.remove(); removed++; return; }
+          }
+          // void 0, void false etc
+          if (t.isUnaryExpression(expr) && expr.operator === 'void' && t.isLiteral(expr.argument)) { path2.remove(); removed++; return; }
+          // Junk arithmetic: 1+1, "x"+"y" with no assignment
+          if (t.isBinaryExpression(expr) && ['+','-','*','/','|','&','^'].includes(expr.operator)) {
+            const lp = t.isLiteral(expr.left), rp = t.isLiteral(expr.right);
+            if (lp && rp) { path2.remove(); removed++; return; }
+          }
+        },
+      });
+      if (removed > 0) log('Removed ' + removed + ' junk statement(s)');
+      else log('No junk statements found');
+    },
+  };
+
   // ── Register all passes ────────────────────────────────────────────────────
   const reg = new TransformRegistry();
   reg.registerAll([
     runtimePatternPass, zeroxDecoderPass, stringArrayCleanupPass,
-    stringDecoderPass, xorDecodingPass, homoglyphCleanupPass,
-    unicodeNormalizationPass, hexDeobfuscationPass, templateLiteralPass,
+    stringDecoderPass, advancedStringDecoderPass, xorDecodingPass,
+    homoglyphCleanupPass, extendedUnicodeNormPass, unicodeNormalizationPass,
+    hexDeobfuscationPass, templateLiteralPass, constantPropagationPass,
     bitwiseSimplifyPass, numericLiteralPass, propertyAccessNormPass,
-    controlFlowPass, rotateSimplificationPass, commaSplitterPass,
-    ternaryUnfoldPass, deadCodePass, astSimplificationPass,
-    antiDebuggerPass, antiDebuggerEnhancedPass, scopeRenamePass,
+    objectAliasPass, controlFlowPass, switchDispatcherPass,
+    rotateSimplificationPass, commaSplitterPass, ternaryUnfoldPass,
+    opaquePredicatePass, junkStatementPass, deadAssignmentPass,
+    deadCodePass, unusedBindingsPass, functionInlinerPass,
+    astSimplificationPass, antiDebuggerPass, antiDebuggerEnhancedPass,
+    scopeRenamePass, semanticRenamePass, iterativeFixedPointPass,
   ]);
   registry = reg;
   pipelineReady = true;
