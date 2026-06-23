@@ -15,6 +15,21 @@
 const _SCRIPT_SRC = (document.currentScript && document.currentScript.src) || '';
 
 // ════════════════════════════════════════════════════════════════════════════
+// WORKER CACHE-BUSTING
+//
+// Browsers (and GitHub Pages' default long cache lifetimes) aggressively
+// cache Worker scripts loaded via `new Worker(url)`. A plain reload often
+// keeps serving a stale worker.js even after you've deployed a fix.
+//
+// Bump WORKER_VERSION on every deploy that touches worker.js to force the
+// browser to fetch the new file. If you forget, the date-based fallback
+// below still busts the cache once per day so stale workers can't linger
+// indefinitely.
+// ════════════════════════════════════════════════════════════════════════════
+const WORKER_VERSION = '3.1'; // bump this string whenever worker.js changes
+const _CACHE_BUST = WORKER_VERSION || new Date().toISOString().slice(0, 10);
+
+// ════════════════════════════════════════════════════════════════════════════
 // ZIP EXPORTER
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -178,7 +193,8 @@ function resolveWorkerUrl() {
 
   // Primary: src captured synchronously from document.currentScript at parse time.
   if (_SCRIPT_SRC && _SCRIPT_SRC.includes('script.js')) {
-    _workerUrlCache = _SCRIPT_SRC.replace(/script\.js([?#].*)?$/, 'worker.js');
+    const base = _SCRIPT_SRC.replace(/script\.js([?#].*)?$/, 'worker.js');
+    _workerUrlCache = base + '?v=' + _CACHE_BUST;
     return _workerUrlCache;
   }
 
@@ -186,13 +202,16 @@ function resolveWorkerUrl() {
   const scripts = document.querySelectorAll('script[src]');
   for (const s of scripts) {
     if (s.src && s.src.includes('script.js')) {
-      _workerUrlCache = s.src.replace(/script\.js([?#].*)?$/, 'worker.js');
+      const base = s.src.replace(/script\.js([?#].*)?$/, 'worker.js');
+      _workerUrlCache = base + '?v=' + _CACHE_BUST;
       return _workerUrlCache;
     }
   }
 
   // Fallback: derive from location — handles any GitHub Pages subpath.
-  _workerUrlCache = new URL('worker.js', location.href).href;
+  const fallbackUrl = new URL('worker.js', location.href);
+  fallbackUrl.searchParams.set('v', _CACHE_BUST);
+  _workerUrlCache = fallbackUrl.href;
   return _workerUrlCache;
 }
 
