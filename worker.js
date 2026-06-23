@@ -592,17 +592,18 @@ async function bootstrap() {
       traverse(ast, {
         StringLiteral(path2) {
           const raw = path2.node.extra?.raw;
-          if (!raw || !/\\\\u[0-9a-fA-F]/.test(raw)) return;
+          // raw is the quoted source text, e.g. '\u0068\u006f' — single backslash before u.
+          // The old regex /\\\\u/ wrongly required TWO backslashes. Fixed to /\\u/.
+          if (!raw || !/\\[ux][0-9a-fA-F]/i.test(raw)) return;
+          // Babel already decoded the value; just emit a clean string literal.
           const decoded = path2.node.value;
-          if (decoded === raw.slice(1, -1)) return;
           const n = t.stringLiteral(decoded);
-          n.loc = path2.node.loc; n.start = path2.node.start; n.end = path2.node.end;
           path2.replaceWith(n); count++;
         },
         TemplateLiteral(path2) {
           path2.node.quasis.forEach(quasi => {
             const raw = quasi.value.raw;
-            if (!raw || !/\\\\u[0-9a-fA-F]/.test(raw)) return;
+            if (!raw || !/\\[ux][0-9a-fA-F]/i.test(raw)) return;
             quasi.value.raw = quasi.value.cooked ?? raw; count++;
           });
         },
@@ -648,11 +649,11 @@ async function bootstrap() {
           }
           path2.replaceWith(t.stringLiteral(result)); collapsed++;
         },
-        BinaryExpression(path2) {
+        BinaryExpression: { exit(path2) {
           if (path2.node.operator !== '+') return;
           const { left, right } = path2.node;
           if (t.isStringLiteral(left) && t.isStringLiteral(right)) { path2.replaceWith(t.stringLiteral(left.value + right.value)); collapsed++; }
-        },
+        }},
       });
       if (collapsed > 0) log('Collapsed ' + collapsed + ' template literal(s)/string concat(s)');
     },
