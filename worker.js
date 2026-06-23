@@ -950,6 +950,28 @@ async function bootstrap() {
     if (node.type === 'StringLiteral') return node.value !== '';
     if (node.type === 'NullLiteral') return false;
     if (node.type === 'Identifier' && node.name === 'undefined') return false;
+    // Fold constant binary comparisons: 1==1, 0===0, 1!==0, etc.
+    if (node.type === 'BinaryExpression') {
+      const lv = getLiteralTruth(node.left);
+      const rv = getLiteralTruth(node.right);
+      // Only fold when both sides are pure literals (not expressions that may have side effects)
+      const leftIsLiteral = node.left && ['BooleanLiteral','NumericLiteral','StringLiteral','NullLiteral'].includes(node.left.type);
+      const rightIsLiteral = node.right && ['BooleanLiteral','NumericLiteral','StringLiteral','NullLiteral'].includes(node.right.type);
+      if (!leftIsLiteral || !rightIsLiteral) return null;
+      const l = node.left.value ?? null;
+      const r = node.right.value ?? null;
+      switch (node.operator) {
+        case '==':  return l == r;   // eslint-disable-line eqeqeq
+        case '!=':  return l != r;   // eslint-disable-line eqeqeq
+        case '===': return l === r;
+        case '!==': return l !== r;
+        case '>':   return l > r;
+        case '>=':  return l >= r;
+        case '<':   return l < r;
+        case '<=':  return l <= r;
+        default:    return null;
+      }
+    }
     return null;
   }
 
@@ -969,7 +991,7 @@ async function bootstrap() {
         ExpressionStatement(path2) {
           const expr = path2.node.expression;
           if (t.isUnaryExpression(expr) && expr.operator === 'void' && t.isNumericLiteral(expr.argument) && expr.argument.value === 0) { path2.remove(); removed++; return; }
-          if (t.isBooleanLiteral(expr) || t.isNullLiteral(expr) || (t.isIdentifier(expr) && expr.name === 'undefined') || (t.isNumericLiteral(expr) && !path2.parentPath.isProgram())) { path2.remove(); removed++; }
+          if (t.isBooleanLiteral(expr) || t.isNullLiteral(expr) || (t.isIdentifier(expr) && expr.name === 'undefined') || t.isNumericLiteral(expr)) { path2.remove(); removed++; }
         },
         BlockStatement: { exit(path2) {
           const body = path2.node.body;
