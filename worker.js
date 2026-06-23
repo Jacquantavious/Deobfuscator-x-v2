@@ -1,4 +1,3 @@
-
 let controller = null;
 let registry = null;
 let pipelineReady = false;
@@ -135,6 +134,19 @@ async function bootstrap() {
     },
   };
 
+  function resolveNumericArg(node) {
+    if (t.isNumericLiteral(node)) return node.value;
+    if (t.isStringLiteral(node)) {
+      const v = node.value.trim();
+      const n = /^0[xX][0-9a-fA-F]+$/.test(v) ? parseInt(v, 16) : Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    if (t.isUnaryExpression(node) && node.operator === '-') {
+      const inner = resolveNumericArg(node.argument);
+      return inner === null ? null : -inner;
+    }
+    return null;
+  }
   function xorStrings(str, key) {
     let r = '';
     for (let i = 0; i < str.length; i++) r += String.fromCharCode(str.charCodeAt(i) ^ key.charCodeAt(i % key.length));
@@ -215,13 +227,16 @@ async function bootstrap() {
           const arr = stringArrays.get(arrayName);
           if (!arr) return;
           const indexArg = path2.node.arguments[0];
-          if (!t.isNumericLiteral(indexArg)) return;
-          let idx = indexArg.value - offset;
+          const idxValue = resolveNumericArg(indexArg);
+          if (idxValue === null) return;
+          let idx = idxValue - offset;
           if (idx < 0 || idx >= arr.length) return;
           let str = arr[idx];
           if (str === null) return;
-          if (xorKey && path2.node.arguments[1] && t.isStringLiteral(path2.node.arguments[1]))
-            str = xorStrings(str, path2.node.arguments[1].value);
+          if (xorKey && path2.node.arguments[1]) {
+            const xargRaw = path2.node.arguments[1];
+            if (t.isStringLiteral(xargRaw)) str = xorStrings(str, xargRaw.value);
+          }
           path2.replaceWith(t.stringLiteral(str));
           inlined++;
         },
