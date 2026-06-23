@@ -182,10 +182,10 @@ async function bootstrap() {
       traverse(ast, {
         VariableDeclarator(path2) {
           const { id, init } = path2.node;
-          if (!t.isIdentifier(id) || !t.isArrayExpression(init) || init.elements.length < 3) return;
+          if (!t.isIdentifier(id) || !t.isArrayExpression(init) || init.elements.length < 2) return;
           const strings = []; let sc = 0;
           for (const el of init.elements) { if (t.isStringLiteral(el)) { strings.push(el.value); sc++; } else strings.push(null); }
-          if (sc / init.elements.length >= 0.8 && /^_0x[a-fA-F0-9]+$/.test(id.name)) stringArrays.set(id.name, strings);
+          if (sc / init.elements.length >= 0.5 && /^_0x[a-fA-F0-9]+$/.test(id.name)) stringArrays.set(id.name, strings);
         },
       });
       if (stringArrays.size === 0) { log('No _0x string arrays found'); return; }
@@ -278,7 +278,7 @@ async function bootstrap() {
       traverse(ast, {
         VariableDeclarator(path2) {
           const { id, init } = path2.node;
-          if (!t.isIdentifier(id) || !t.isArrayExpression(init) || init.elements.length < 10) return;
+          if (!t.isIdentifier(id) || !t.isArrayExpression(init) || init.elements.length < 2) return;
           const elements = init.elements.map(el => {
             if (t.isStringLiteral(el)) return el.value;
             if (t.isNumericLiteral(el)) return el.value;
@@ -286,7 +286,7 @@ async function bootstrap() {
             return undefined;
           });
           const sc = elements.filter(e => typeof e === 'string').length;
-          if (sc / elements.length < 0.7 || elements.some(e => e === undefined)) return;
+          if (sc / elements.length < 0.5 || elements.some(e => e === undefined)) return;
           candidates.set(id.name, elements);
         },
       });
