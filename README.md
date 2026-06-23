@@ -2,7 +2,7 @@
 
 A fully in-browser, zero-install JavaScript deobfuscation engine with 18 AST transformation passes, Monaco Editor, and a batch processing pipeline.
 
-**[→ Live Demo](https://your-username.github.io/deobfuscator-x-v3/)**
+**[→ Live Demo](https://jacquantavious.github.io/Deobfuscator-x-v2/)**
 
 ---
 
