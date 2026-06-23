@@ -1170,12 +1170,10 @@ async function bootstrap() {
     const parseStart = performance.now();
     let ast;
     try {
-      ast = _cache.get(code);
-      if (ast) { ast = JSON.parse(JSON.stringify(ast)); emit(15, 'AST from cache'); }
-      else {
-        ast = parse(code, { sourceType: 'unambiguous', allowImportExportEverywhere: true, allowReturnOutsideFunction: true, allowSuperOutsideMethod: true, allowUndeclaredExports: true, errorRecovery: true, plugins: ['jsx','typescript','classProperties','classPrivateProperties','classPrivateMethods','classStaticBlock','dynamicImport','exportDefaultFrom','exportNamespaceFrom','importMeta','nullishCoalescingOperator','optionalChaining','decorators-legacy','bigInt','numericSeparator','logicalAssignment'] });
-        _cache.set(code, ast);
-      }
+      // Always re-parse: JSON.parse(JSON.stringify(ast)) strips Babel's internal
+      // path/scope linkages, so path.remove() and path.replaceWith() silently fail
+      // on JSON-cloned ASTs. Re-parsing is safe and fast enough for this use case.
+      ast = parse(code, { sourceType: 'unambiguous', allowImportExportEverywhere: true, allowReturnOutsideFunction: true, allowSuperOutsideMethod: true, allowUndeclaredExports: true, errorRecovery: true, plugins: ['jsx','typescript','classProperties','classPrivateProperties','classPrivateMethods','classStaticBlock','dynamicImport','exportDefaultFrom','exportNamespaceFrom','importMeta','nullishCoalescingOperator','optionalChaining','decorators-legacy','bigInt','numericSeparator','logicalAssignment'] });
     } catch(err) { stats.totalTime = performance.now() - startTime; return { ok: false, error: 'Parse error: ' + err.message, output: null, stats }; }
     stats.parseTime = performance.now() - parseStart;
     emit(15, 'AST ready in ' + stats.parseTime.toFixed(0) + 'ms');
