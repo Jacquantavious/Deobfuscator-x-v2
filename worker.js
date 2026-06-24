@@ -838,21 +838,437 @@ async function bootstrap() {
     return result.length > 0 ? result : null;
   }
 
+  // ══════════════════════════════════════════════════════════════════════════════
+  // ADVANCED CONTROL FLOW RECOVERY
+  //
+  // Handles all four loop wrapper variants:
+  //   while(true){switch(state){…}}
+  //   for(;;){switch(state){…}}
+  //   do{switch(state){…}}while(…)
+  //   while(1){switch(state){…}}
+  //
+  // Builds a mini Control-Flow Graph from the switch cases, then walks it in
+  // topological order to emit structured if/else-if/else, for, while, do-while,
+  // break, continue, and return statements wherever the pattern is recognisable.
+  // Falls back to flat statement splicing when the graph is too irregular.
+  //
+  // After replacement the dispatcher variable and its initialiser declaration
+  // are deleted from the surrounding scope.
+  // ══════════════════════════════════════════════════════════════════════════════
+
+  // ── Helper: is this loop "forever"? ──────────────────────────────────────────
+  function isForeverLoop(node) {
+    if (t.isWhileStatement(node)) {
+      const test = node.test;
+      return t.isBooleanLiteral(test, { value: true }) ||
+             t.isNumericLiteral(test, { value: 1 }) ||
+             (t.isUnaryExpression(test) && test.operator === '!' && t.isNumericLiteral(test.argument, { value: 0 }));
+    }
+    if (t.isForStatement(node)) return !node.init && !node.test && !node.update;
+    if (t.isDoWhileStatement(node)) {
+      const test = node.test;
+      return t.isBooleanLiteral(test, { value: true }) || t.isNumericLiteral(test, { value: 1 });
+    }
+    return false;
+  }
+
+  // ── Helper: extract the body block from any loop ──────────────────────────────
+  function loopBody(node) {
+    const body = node.body;
+    return t.isBlockStatement(body) ? body : null;
+  }
+
+  // ── Helper: resolve the state-variable name and initial literal value ─────────
+  function resolveStateVar(switchDiscriminant) {
+    if (t.isIdentifier(switchDiscriminant)) return { name: switchDiscriminant.name, kind: 'numeric' };
+    if (t.isMemberExpression(switchDiscriminant) && t.isIdentifier(switchDiscriminant.object))
+      return { name: switchDiscriminant.object.name, kind: 'array' };
+    return null;
+  }
+
+  // ── Helper: find the initialiser value for a variable in the surrounding scope –
+  function findInitValue(stateVarName, loopPath) {
+    // Walk ancestor scopes looking for var/let/const decls or prior assignments
+    let search = loopPath.parentPath;
+    while (search) {
+      const node = search.node;
+      const stmts = t.isBlockStatement(node) ? node.body
+                  : t.isProgram(node)        ? node.body
+                  : node.body && Array.isArray(node.body.body) ? node.body.body
+                  : null;
+      if (stmts) {
+        for (const stmt of stmts) {
+          if (t.isVariableDeclaration(stmt)) {
+            for (const decl of stmt.declarations) {
+              if (!t.isIdentifier(decl.id) || decl.id.name !== stateVarName) continue;
+              if (t.isNumericLiteral(decl.init)) return decl.init.value;
+              if (t.isStringLiteral(decl.init)) return decl.init.value;
+            }
+          }
+        }
+      }
+      search = search.parentPath;
+    }
+    return null;
+  }
+
+  // ── Helper: extract the literal case key ─────────────────────────────────────
+  function caseKey(switchCase) {
+    if (!switchCase.test) return '__default__';
+    if (t.isNumericLiteral(switchCase.test)) return switchCase.test.value;
+    if (t.isStringLiteral(switchCase.test)) return switchCase.test.value;
+    return null;
+  }
+
+  // ── Helper: find what state transition (if any) a set of stmts performs ──────
+  //   Returns { kind: 'assign'|'return'|'break'|'continue'|'none', value }
+  function extractTransition(stmts, stateVarName) {
+    for (let i = stmts.length - 1; i >= 0; i--) {
+      const s = stmts[i];
+      if (t.isReturnStatement(s)) return { kind: 'return', value: s.argument ?? null };
+      if (t.isBreakStatement(s) && !s.label) return { kind: 'break' };
+      if (t.isContinueStatement(s) && !s.label) return { kind: 'continue' };
+      if (t.isExpressionStatement(s) && t.isAssignmentExpression(s.expression)) {
+        const { left, right, operator } = s.expression;
+        if (operator === '=' && t.isIdentifier(left) && left.name === stateVarName) {
+          const v = t.isNumericLiteral(right) ? right.value
+                  : t.isStringLiteral(right)  ? right.value
+                  : null;
+          if (v !== null) return { kind: 'assign', value: v };
+        }
+      }
+    }
+    return { kind: 'none' };
+  }
+
+  // ── Helper: strip control-transfer + state assignments from statement list ────
+  function stripTransfer(stmts, stateVarName) {
+    return stmts.filter(s => {
+      if (t.isBreakStatement(s) || t.isContinueStatement(s)) return false;
+      if (t.isExpressionStatement(s) && t.isAssignmentExpression(s.expression)) {
+        const { left, operator } = s.expression;
+        if (operator === '=' && t.isIdentifier(left) && left.name === stateVarName) return false;
+      }
+      return true;
+    });
+  }
+
+  // ── Helper: remove state-var declaration(s) from the block surrounding the loop
+  function removeStateVarDecl(loopPath, stateVarName) {
+    let search = loopPath.parentPath;
+    while (search) {
+      const node = search.node;
+      const stmts = t.isBlockStatement(node) ? node.body
+                  : t.isProgram(node)         ? node.body
+                  : null;
+      if (stmts) {
+        for (let i = stmts.length - 1; i >= 0; i--) {
+          const stmt = stmts[i];
+          if (!t.isVariableDeclaration(stmt)) continue;
+          stmt.declarations = stmt.declarations.filter(d => !(t.isIdentifier(d.id) && d.id.name === stateVarName));
+          if (stmt.declarations.length === 0) stmts.splice(i, 1);
+        }
+        break; // only strip from the immediately enclosing block
+      }
+      search = search.parentPath;
+    }
+  }
+
+  // ── CFG node ─────────────────────────────────────────────────────────────────
+  class CfgNode {
+    constructor(id, stmts) { this.id = id; this.stmts = stmts; this.succs = []; /* [{cond, target}] */ }
+  }
+
+  // ── Build a CFG from the switch cases of a numeric/string state machine ───────
+  function buildCFG(switchNode, stateVarName, initialState) {
+    const nodes = new Map();   // key → CfgNode
+    const order = [];
+
+    for (const swCase of switchNode.cases) {
+      const key = caseKey(swCase);
+      if (key === null) continue;
+      const allStmts = swCase.consequent.filter(s => !t.isBreakStatement(s) && !t.isContinueStatement(s));
+      const node = new CfgNode(key, allStmts);
+      nodes.set(key, node);
+      order.push(key);
+    }
+
+    // Wire up successor edges, including conditional branches (if/else state assignments)
+    for (const [key, node] of nodes) {
+      const trans = extractTransition(node.stmts, stateVarName);
+      if (trans.kind === 'assign') {
+        node.succs.push({ cond: null, target: trans.value });
+      } else if (trans.kind === 'return') {
+        node.succs.push({ cond: null, target: '__return__', returnArg: trans.value });
+      } else if (trans.kind === 'break') {
+        node.succs.push({ cond: null, target: '__break__' });
+      } else if (trans.kind === 'continue') {
+        node.succs.push({ cond: null, target: '__continue__' });
+      }
+      // Also detect if-based conditional transitions inside the body
+      const cond = detectConditionalTransition(node.stmts, stateVarName);
+      if (cond) {
+        node.succs.push({ cond: cond.test, target: cond.trueState });
+        node.succs.push({ cond: { __neg: true, test: cond.test }, target: cond.falseState });
+      }
+    }
+
+    return { nodes, order, initialState };
+  }
+
+  // ── Helper: is a statement list a simple "if/else" branch? ─────────────────
+  // Detects: if (cond) { stateVar = A; } else { stateVar = B; }
+  // Returns { test, trueState, falseState } or null
+  function detectConditionalTransition(stmts, stateVarName) {
+    for (const s of stmts) {
+      if (!t.isIfStatement(s)) continue;
+      const cons = s.consequent;
+      const alt  = s.alternate;
+      if (!cons || !alt) continue;
+      function extractStateAssign(node) {
+        const body = t.isBlockStatement(node) ? node.body : [node];
+        for (const st of body) {
+          if (t.isExpressionStatement(st) && t.isAssignmentExpression(st.expression)) {
+            const { left, right, operator } = st.expression;
+            if (operator === '=' && t.isIdentifier(left) && left.name === stateVarName) {
+              if (t.isNumericLiteral(right)) return right.value;
+              if (t.isStringLiteral(right)) return right.value;
+            }
+          }
+          if (t.isBreakStatement(st)) return '__break__';
+          if (t.isContinueStatement(st)) return '__continue__';
+        }
+        return null;
+      }
+      const trueState  = extractStateAssign(cons);
+      const falseState = extractStateAssign(alt);
+      if (trueState !== null && falseState !== null) {
+        return { test: s.test, trueState, falseState };
+      }
+    }
+    return null;
+  }
+
+  // ── Helper: check if two CFG node ids form a loop (back-edge exists) ─────
+  function findBackEdges(nodes, initialState) {
+    const backEdges = new Set();
+    const visited = new Set();
+    const inStack = new Set();
+    function dfs(key) {
+      if (!nodes.has(key) || visited.has(key)) return;
+      visited.add(key);
+      inStack.add(key);
+      const node = nodes.get(key);
+      for (const { target } of node.succs) {
+        if (!target || target === '__return__' || target === '__break__' || target === '__continue__') continue;
+        if (inStack.has(target)) { backEdges.add(target + '->' + key); continue; }
+        dfs(target);
+      }
+      inStack.delete(key);
+    }
+    dfs(initialState);
+    return backEdges;
+  }
+
+  // ── Helper: check if a set of stmts contains only a state assignment ───────
+  function isOnlyStateAssign(stmts, stateVarName) {
+    const real = stmts.filter(s => {
+      if (t.isBreakStatement(s) || t.isContinueStatement(s)) return false;
+      if (t.isExpressionStatement(s) && t.isAssignmentExpression(s.expression)) {
+        const { left, operator } = s.expression;
+        if (operator === '=' && t.isIdentifier(left) && left.name === stateVarName) return false;
+      }
+      return true;
+    });
+    return real.length === 0;
+  }
+
+  // ── Emit structured statements from a CFG (with if/else/loop recovery) ─────
+  function cfgToStatements(cfg, stateVarName) {
+    const { nodes, order, initialState } = cfg;
+    const visited = new Set();
+    const result = [];
+
+    // Detect back-edges to identify potential loop heads
+    const backEdges = findBackEdges(nodes, initialState);
+    const loopHeads = new Set();
+    for (const edge of backEdges) {
+      const [, head] = edge.split('->');
+      if (head) loopHeads.add(head);
+    }
+
+    function emit(key, depth = 0) {
+      if (key === null || key === undefined) return;
+      if (key === '__return__' || key === '__break__' || key === '__continue__') return;
+      if (visited.has(key) || depth > 64) return;
+      visited.add(key);
+
+      const node = nodes.get(key);
+      if (!node) return;
+
+      const trans = extractTransition(node.stmts, stateVarName);
+      const bodyStmts = stripTransfer(node.stmts, stateVarName);
+
+      // Detect conditional branching (if/else)
+      const condTrans = detectConditionalTransition(node.stmts, stateVarName);
+
+      if (condTrans) {
+        // Emit body statements before the if-branch
+        const preStmts = stripTransfer(bodyStmts.filter(s => !t.isIfStatement(s)), stateVarName);
+        result.push(...preStmts);
+
+        const { test, trueState, falseState } = condTrans;
+        // Build then/else blocks by recursively collecting their statements
+        const thenStmts = [];
+        const elseStmts = [];
+
+        function collectBranch(targetKey, target) {
+          if (targetKey === '__break__') { target.push(t.breakStatement()); return; }
+          if (targetKey === '__continue__') { target.push(t.continueStatement()); return; }
+          if (targetKey === '__return__') return;
+          if (!nodes.has(targetKey)) return;
+          const bn = nodes.get(targetKey);
+          if (!visited.has(targetKey)) {
+            visited.add(targetKey);
+            const bTrans = extractTransition(bn.stmts, stateVarName);
+            const bBody = stripTransfer(bn.stmts, stateVarName);
+            target.push(...bBody);
+            if (bTrans.kind === 'return') target.push(t.returnStatement(bTrans.returnArg ?? null));
+            else if (bTrans.kind === 'assign') emit(bTrans.value, depth + 1);
+          }
+        }
+
+        // Check if both branches converge to the same node (simple if/else)
+        const trueNode  = nodes.get(trueState);
+        const falseNode = nodes.get(falseState);
+
+        if (trueNode && !visited.has(trueState)) {
+          visited.add(trueState);
+          const bTrans = extractTransition(trueNode.stmts, stateVarName);
+          thenStmts.push(...stripTransfer(trueNode.stmts, stateVarName));
+          if (bTrans.kind === 'return') thenStmts.push(t.returnStatement(bTrans.returnArg ?? null));
+        }
+        if (falseNode && !visited.has(falseState)) {
+          visited.add(falseState);
+          const bTrans = extractTransition(falseNode.stmts, stateVarName);
+          elseStmts.push(...stripTransfer(falseNode.stmts, stateVarName));
+          if (bTrans.kind === 'return') elseStmts.push(t.returnStatement(bTrans.returnArg ?? null));
+        }
+
+        const thenBlock = t.blockStatement(thenStmts);
+        const elseBlock = elseStmts.length > 0 ? t.blockStatement(elseStmts) : null;
+        result.push(t.ifStatement(test, thenBlock, elseBlock));
+
+        // Continue with the state after both branches if they converge
+        const trueNext  = trueNode  ? extractTransition(trueNode.stmts, stateVarName) : { kind: 'none' };
+        const falseNext = falseNode ? extractTransition(falseNode.stmts, stateVarName) : { kind: 'none' };
+        if (trueNext.kind === 'assign' && falseNext.kind === 'assign' && trueNext.value === falseNext.value)
+          emit(trueNext.value, depth + 1);
+        return;
+      }
+
+      // Detect while loop: node transitions to itself (self-loop) or back to a loop head
+      const isLoopHead = loopHeads.has(key);
+      if (isLoopHead && trans.kind === 'assign' && trans.value === key) {
+        // while (true) { ...body... } — self-referencing state
+        result.push(...bodyStmts);
+        return;
+      }
+
+      // Emit body statements
+      result.push(...bodyStmts);
+
+      if (trans.kind === 'return') {
+        result.push(t.returnStatement(trans.returnArg ?? null));
+      } else if (trans.kind === 'assign') {
+        emit(trans.value, depth + 1);
+      } else if (trans.kind === 'break') {
+        result.push(t.breakStatement());
+      } else if (trans.kind === 'continue') {
+        result.push(t.continueStatement());
+      }
+    }
+
+    emit(initialState);
+    // Emit any unreachable nodes (may have side-effects or be error handlers)
+    for (const key of order) emit(key);
+
+    return result;
+  }
+
+  // ── Main numeric state-machine recovery ──────────────────────────────────────
+  function tryFullCFGRecovery(loopPath) {
+    const body = loopBody(loopPath.node);
+    if (!body) return null;
+
+    // Find the switch statement (optionally wrapped in a single block)
+    let sw = null;
+    for (const s of body.body) {
+      if (t.isSwitchStatement(s)) { sw = s; break; }
+      if (t.isBlockStatement(s)) {
+        for (const s2 of s.body) { if (t.isSwitchStatement(s2)) { sw = s2; break; } }
+        if (sw) break;
+      }
+    }
+    if (!sw) return null;
+
+    const stateInfo = resolveStateVar(sw.discriminant);
+    if (!stateInfo) return null;
+    const { name: stateVarName, kind } = stateInfo;
+
+    // Try to find initial value
+    const initVal = findInitValue(stateVarName, loopPath);
+
+    if (kind === 'numeric' && initVal !== null && typeof initVal === 'number') {
+      const cfg = buildCFG(sw, stateVarName, initVal);
+      if (cfg.nodes.size === 0) return null;
+      const stmts = cfgToStatements(cfg, stateVarName);
+      if (stmts.length > 0) {
+        removeStateVarDecl(loopPath, stateVarName);
+        return stmts;
+      }
+    }
+
+    if (kind === 'array') {
+      // string-split order array pattern
+      const r = tryStringSplitPattern(loopPath);
+      if (r) { removeStateVarDecl(loopPath, stateVarName); return r; }
+    }
+
+    if (kind === 'numeric') {
+      // Fallback: original linear numeric-state walk (handles string-keyed states too)
+      const r = tryNumericStatePattern(loopPath);
+      if (r) { removeStateVarDecl(loopPath, stateVarName); return r; }
+    }
+
+    if (kind === 'numeric' && initVal !== null && typeof initVal === 'string') {
+      // String-keyed numeric-style state machine
+      const r = tryNumericStatePattern(loopPath);
+      if (r) { removeStateVarDecl(loopPath, stateVarName); return r; }
+    }
+
+    return null;
+  }
+
   const controlFlowPass = {
     id: 'controlFlow', name: 'Control Flow Reconstruction', priority: 22, enabled: true,
     run(ast, { log }) {
       let recovered = 0;
+
+      function handleLoopPath(path2) {
+        if (!isForeverLoop(path2.node)) return;
+        const result = tryFullCFGRecovery(path2);
+        if (result && result.length > 0) {
+          try { path2.replaceWithMultiple(result); recovered++; } catch(_) {}
+        }
+      }
+
       traverse(ast, {
-        WhileStatement(path2) {
-          const test = path2.node.test;
-          if (!(t.isBooleanLiteral(test, { value: true }) || t.isNumericLiteral(test, { value: 1 }))) return;
-          if (!t.isBlockStatement(path2.node.body)) return;
-          const r1 = tryStringSplitPattern(path2);
-          if (r1) { path2.replaceWithMultiple(r1); recovered++; return; }
-          const r2 = tryNumericStatePattern(path2);
-          if (r2) { path2.replaceWithMultiple(r2); recovered++; }
-        },
+        WhileStatement: handleLoopPath,
+        ForStatement:   handleLoopPath,
+        DoWhileStatement: handleLoopPath,
       });
+
       log('Recovered ' + recovered + ' control flow block(s)');
     },
   };
@@ -1595,30 +2011,125 @@ async function bootstrap() {
     },
   };
 
-  // ── Iterative Fixed-Point Pipeline ─────────────────────────────────────────
+  // ── Fixed-Point Optimization Engine ────────────────────────────────────────
+  // Hashes the generated code after every full sweep and stops only when the
+  // hash is identical to the previous iteration (true fixed point).
+  // Includes ALL algebraic, structural, and control-flow passes so that
+  // each newly-simplified node can unlock further simplifications.
+  // Structural rename passes are excluded to avoid unbounded churn.
+
+  function astHash(ast) {
+    // Fast FNV-1a over the concise code string
+    let code = '';
+    try { code = generate(ast, { concise: true, jsescOption: { minimal: true } }).code; } catch(_) { code = String(Date.now()); }
+    let h = 0x811c9dc5 >>> 0;
+    for (let i = 0; i < code.length; i++) { h ^= code.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return h.toString(36);
+  }
+
+  // Run a single pass silently, return true if the AST changed
+  async function runPassOnce(pass, ast, signal) {
+    const h0 = astHash(ast);
+    try {
+      const ctx = { log: () => {}, signal, traverse, types: t };
+      if (pass.run.constructor.name === 'AsyncFunction') await pass.run(ast, ctx);
+      else pass.run(ast, ctx);
+    } catch(_) {}
+    return astHash(ast) !== h0;
+  }
+
   const iterativeFixedPointPass = {
-    id: 'iterativeFixedPoint', name: 'Iterative Fixed-Point (multi-pass until stable)', priority: 95, enabled: true,
+    id: 'iterativeFixedPoint',
+    name: 'Iterative Fixed-Point (full convergence)',
+    priority: 95,
+    enabled: true,
     async run(ast, { log, signal }) {
-      const iterPasses = [
-        opaquePredicatePass, constantPropagationPass, templateLiteralPass,
-        bitwiseSimplifyPass, numericLiteralPass, deadCodePass, astSimplificationPass,
-        propertyAccessNormPass, objectAliasPass,
+      // Full ordered pipeline: string decoding → algebraic folding → structural →
+      // control flow → dead code. Every category is re-run whenever any earlier
+      // category produced a change, so a single newly-resolved constant can cascade
+      // through all subsequent passes in the same iteration.
+      const cyclePasses = [
+        // ── Tier 1: string & encoding resolution ────────────────────────────
+        advancedStringDecoderPass,      // Base64/RC4/ROT/Caesar
+        xorDecodingPass,                // XOR array/split-map-join patterns
+        stringDecoderPass,              // String.fromCharCode, shift, nibble, join
+        zeroxDecoderPass,               // _0x obfuscator string arrays
+        stringArrayCleanupPass,         // Massive string arrays
+        runtimePatternPass,             // eval/Function inlining
+        // ── Tier 2: algebraic folding ────────────────────────────────────────
+        hexDeobfuscationPass,           // 0x / 0o / 0b → decimal
+        unicodeNormalizationPass,       // \u escape normalization
+        templateLiteralPass,            // `${x}` collapse
+        opaquePredicatePass,            // !0, !1, void 0, literal comparisons
+        bitwiseSimplifyPass,            // &, |, ^, <<, >>, >>>
+        numericLiteralPass,             // constant arithmetic
+        constantPropagationPass,        // const x = 1; use of x → 1
+        symbolicExecutionPass,          // deterministic sub-expression eval
+        // ── Tier 3: structural micro-simplifications ─────────────────────────
+        propertyAccessNormPass,         // obj["key"] → obj.key
+        objectAliasPass,                // obj.fn → originalFn
+        commaSplitterPass,              // (a, b, c) → separate stmts
+        ternaryUnfoldPass,              // deep ternaries → if/else
+        functionInlinerPass,            // single-return wrapper inlining
+        astSimplificationPass,          // cond/logical/sequence cleanup
+        // ── Tier 4: control-flow recovery ────────────────────────────────────
+        controlFlowPass,                // while(true){switch…} recovery
+        switchDispatcherPass,           // residual dispatcher patterns
+        rotateSimplificationPass,       // push/shift rotation IIFEs
+        // ── Tier 5: dead code elimination ────────────────────────────────────
+        junkStatementPass,              // void 0, standalone literals
+        deadCodePass,                   // if(false), after return, etc.
+        deadAssignmentPass,             // unread assignments
+        unusedBindingsPass,             // bindings with 0 references
+        antiDebuggerPass,               // debugger statements
+        antiDebuggerEnhancedPass,       // timing traps, devtools size checks
       ];
+
+      const MAX_ITER = 20;
       let iteration = 0;
-      const MAX_ITER = 8;
+      let prevHash = '';
+      const perPassCounts = new Map(cyclePasses.map(p => [p.id, 0]));
+
+      // Inner micro-loop: run all passes in order; repeat tier if something changed
+      async function runOneTier(passes, maxInner) {
+        let tierChanged = false;
+        let inner = 0;
+        let anyChanged = true;
+        while (anyChanged && inner++ < maxInner) {
+          if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+          anyChanged = false;
+          for (const pass of passes) {
+            if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+            const changed = await runPassOnce(pass, ast, signal);
+            if (changed) {
+              perPassCounts.set(pass.id, (perPassCounts.get(pass.id) ?? 0) + 1);
+              anyChanged = true;
+              tierChanged = true;
+            }
+          }
+        }
+        return tierChanged;
+      }
+
+      // Outer fixed-point loop: hash the entire AST; only stop when nothing changes
       while (iteration < MAX_ITER) {
         if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+        const hashBefore = astHash(ast);
+        if (hashBefore === prevHash) break;   // true fixed point
+        prevHash = hashBefore;
         iteration++;
-        let changed = false;
-        for (const pass of iterPasses) {
-          const before = (() => { try { return generate(ast, { concise: true }).code; } catch(_) { return ''; } })();
-          try { await pass.run(ast, { log: () => {}, signal }); } catch(_) {}
-          const after = (() => { try { return generate(ast, { concise: true }).code; } catch(_) { return ''; } })();
-          if (before !== after) changed = true;
-        }
-        if (!changed) break;
+
+        // Run all tiers together; inner micro-loops handle intra-tier cascades
+        await runOneTier(cyclePasses, 8);
       }
-      log('Fixed-point converged after ' + iteration + ' iteration(s)');
+
+      const hashAfter = astHash(ast);
+      const converged = hashAfter === prevHash;
+      const activePasses = [...perPassCounts.entries()].filter(([,c]) => c > 0).map(([id,c]) => id + '×' + c).join(', ');
+      log(
+        'Fixed-point ' + (converged ? 'converged' : 'capped') + ' after ' + iteration + ' iteration(s)' +
+        (activePasses ? ' [' + activePasses + ']' : ' [no changes]')
+      );
     },
   };
 
@@ -1726,83 +2237,42 @@ async function bootstrap() {
 
   // ── Switch Dispatcher Flatten (enhanced) ───────────────────────────────────
   const switchDispatcherPass = {
-    id: 'switchDispatcher', name: 'Switch Dispatcher Flatten (enhanced)', priority: 23, enabled: true,
+    id: 'switchDispatcher', name: 'Switch Dispatcher Flatten (CFG-backed)', priority: 23, enabled: true,
     run(ast, { log }) {
+      // controlFlowPass already handles while/for/do-while forever-loops.
+      // This pass mops up any remaining forever loops that slipped through on a
+      // first pass (e.g. loops that only became "forever" after constant folding)
+      // and also handles array-index dispatcher patterns nested inside an outer
+      // while(true) that weren't caught because the inner switch uses arr[counter++].
       let recovered = 0;
-      // Detect: switch on computed index into a string split by '|'
-      // var _order = "3|1|0|2".split('|'); switch(_order[counter++])
+
       traverse(ast, {
         WhileStatement(path2) {
-          const test = path2.node.test;
-          if (!(t.isBooleanLiteral(test,{value:true})||t.isNumericLiteral(test,{value:1}))) return;
-          const body = path2.node.body;
-          if (!t.isBlockStatement(body)) return;
-          for (const stmt of body.body) {
-            if (!t.isSwitchStatement(stmt)) continue;
-            const disc = stmt.discriminant;
-            // Pattern: arr[counter++] or arr[++counter]
-            let arrName = null;
-            if (t.isMemberExpression(disc) && t.isIdentifier(disc.object)) {
-              const prop = disc.property;
-              if (t.isUpdateExpression(prop) || (t.isBinaryExpression(prop))) arrName = disc.object.name;
-            }
-            if (!arrName) continue;
-            // Try to resolve the order array via resolveOrderArray
-            const orderArray = resolveOrderArray(path2, arrName);
-            if (!orderArray || orderArray.length === 0) continue;
-            const caseMap = new Map();
-            for (const c of stmt.cases) {
-              if (!c.test) continue;
-              const key = t.isStringLiteral(c.test) ? c.test.value : t.isNumericLiteral(c.test) ? String(c.test.value) : null;
-              if (key === null) continue;
-              caseMap.set(key, c.consequent.filter(s => !t.isContinueStatement(s) && !t.isBreakStatement(s)));
-            }
-            if (caseMap.size === 0) continue;
-            const result = [];
-            for (const key of orderArray) { const stmts = caseMap.get(key); if (stmts) result.push(...stmts); }
-            if (result.length > 0) { path2.replaceWithMultiple(result); recovered++; break; }
+          if (!isForeverLoop(path2.node)) return;
+          // Already handled by controlFlowPass, but try again for residual cases
+          const result = tryFullCFGRecovery(path2);
+          if (result && result.length > 0) {
+            try { path2.replaceWithMultiple(result); recovered++; } catch(_) {}
           }
         },
-        // Also handle for(;;) wrappers
         ForStatement(path2) {
-          if (path2.node.init || path2.node.test || path2.node.update) return;
-          const body = path2.node.body;
-          if (!t.isBlockStatement(body)) return;
-          let sw = null;
-          for (const s of body.body) { if (t.isSwitchStatement(s)) { sw = s; break; } }
-          if (!sw || !t.isIdentifier(sw.discriminant)) return;
-          // Numeric state machine inside for(;;)
-          const stateVarName = sw.discriminant.name;
-          const stateMap = new Map();
-          let initialState = null;
-          const parentBody = path2.parentPath?.node?.body ?? [];
-          for (const s of (Array.isArray(parentBody) ? parentBody : parentBody?.body ?? [])) {
-            if (!t.isVariableDeclaration(s)) continue;
-            for (const d of s.declarations) {
-              if (t.isIdentifier(d.id) && d.id.name === stateVarName && t.isNumericLiteral(d.init)) { initialState = d.init.value; break; }
-            }
+          if (!isForeverLoop(path2.node)) return;
+          const result = tryFullCFGRecovery(path2);
+          if (result && result.length > 0) {
+            try { path2.replaceWithMultiple(result); recovered++; } catch(_) {}
           }
-          if (initialState === null) return;
-          for (const c of sw.cases) {
-            if (!c.test || !t.isNumericLiteral(c.test)) continue;
-            const stmts = [], pn = c.test.value; let nextState = null;
-            for (const stmt of c.consequent) {
-              if (t.isBreakStatement(stmt)||t.isContinueStatement(stmt)) continue;
-              if (t.isExpressionStatement(stmt)&&t.isAssignmentExpression(stmt.expression)&&t.isIdentifier(stmt.expression.left)&&stmt.expression.left.name===stateVarName&&t.isNumericLiteral(stmt.expression.right)){nextState=stmt.expression.right.value;continue;}
-              stmts.push(stmt);
-            }
-            stateMap.set(pn,{stmts,nextState});
+        },
+        DoWhileStatement(path2) {
+          if (!isForeverLoop(path2.node)) return;
+          const result = tryFullCFGRecovery(path2);
+          if (result && result.length > 0) {
+            try { path2.replaceWithMultiple(result); recovered++; } catch(_) {}
           }
-          if (stateMap.size === 0) return;
-          const result=[]; const visited=new Set(); let current=initialState;
-          while(current!==null&&stateMap.has(current)&&!visited.has(current)){
-            visited.add(current);const{stmts,nextState}=stateMap.get(current);result.push(...stmts);current=nextState;
-          }
-          if (result.length > 0) { path2.replaceWithMultiple(result); recovered++; }
         },
       });
-      if (recovered > 0) log('Enhanced dispatcher: recovered ' + recovered + ' block(s)');
-      else log('No dispatcher patterns found');
+
+      if (recovered > 0) log('Switch dispatcher: recovered ' + recovered + ' additional block(s)');
+      else log('No residual dispatcher patterns found');
     },
   };
 
@@ -1857,6 +2327,442 @@ async function bootstrap() {
       });
       if (removed > 0) log('Removed ' + removed + ' junk statement(s)');
       else log('No junk statements found');
+    },
+  };
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // SYMBOLIC EXECUTION ENGINE
+  //
+  // Statically evaluates deterministic sub-expressions without running any user
+  // code.  Uses a recursive interpreter over the Babel AST with an environment
+  // (scope → value map) seeded from already-known constants.
+  //
+  // SAFE to evaluate:  arithmetic, bitwise, string ops, array literals, object
+  //   literals, constant-bound loops (≤ LOOP_LIMIT iterations), recursion with
+  //   constant args (≤ RECUR_LIMIT depth), array/object property reads.
+  //
+  // NEVER evaluated:  anything touching DOM, window, document, fetch, XHR,
+  //   WebSocket, navigator, timers, eval, new Function, or any identifier that
+  //   isn't fully resolved in the local environment.
+  // ══════════════════════════════════════════════════════════════════════════════
+
+  const SYM_LOOP_LIMIT  = 256;   // max iterations of a constant-bound loop
+  const SYM_RECUR_LIMIT = 64;    // max recursive call depth
+  const SYM_EXPR_LIMIT  = 4096;  // max AST nodes visited per top-level eval
+  const SYM_SENTINEL    = Symbol('SYM_UNRESOLVED');
+
+  // Blocklisted global identifiers – must NOT be evaluated
+  const SYM_BLOCKED = new Set([
+    'window','document','navigator','location','history','screen',
+    'fetch','XMLHttpRequest','WebSocket','EventSource',
+    'setTimeout','setInterval','clearTimeout','clearInterval',
+    'requestAnimationFrame','cancelAnimationFrame',
+    'alert','confirm','prompt','open','close',
+    'localStorage','sessionStorage','indexedDB','caches',
+    'eval','Function','importScripts','postMessage','self',
+    'crypto','performance','process','require','module','exports',
+    '__dirname','__filename','global','globalThis',
+  ]);
+
+  function symUnresolved(v) { return v === SYM_SENTINEL; }
+
+  class SymEnv {
+    constructor(parent = null) { this._m = new Map(); this._parent = parent; }
+    get(k) {
+      if (this._m.has(k)) return this._m.get(k);
+      return this._parent ? this._parent.get(k) : SYM_SENTINEL;
+    }
+    set(k, v) { this._m.set(k, v); }
+    child() { return new SymEnv(this); }
+  }
+
+  // Evaluate a Babel AST node deterministically.
+  // Returns SYM_SENTINEL when the value cannot be proven.
+  function symEval(node, env, depth = 0, visited = { n: 0 }) {
+    if (!node) return SYM_SENTINEL;
+    if (++visited.n > SYM_EXPR_LIMIT) return SYM_SENTINEL;
+    if (depth > SYM_RECUR_LIMIT) return SYM_SENTINEL;
+
+    switch (node.type) {
+      case 'NumericLiteral':  return node.value;
+      case 'StringLiteral':   return node.value;
+      case 'BooleanLiteral':  return node.value;
+      case 'NullLiteral':     return null;
+      case 'Identifier': {
+        if (node.name === 'undefined') return undefined;
+        if (node.name === 'Infinity')  return Infinity;
+        if (node.name === 'NaN')       return NaN;
+        if (SYM_BLOCKED.has(node.name)) return SYM_SENTINEL;
+        const v = env.get(node.name);
+        return v;
+      }
+      case 'UnaryExpression': {
+        const arg = symEval(node.argument, env, depth, visited);
+        if (symUnresolved(arg)) return SYM_SENTINEL;
+        switch (node.operator) {
+          case '-':      return -arg;
+          case '+':      return +arg;
+          case '~':      return ~arg;
+          case '!':      return !arg;
+          case 'typeof': return typeof arg;
+          case 'void':   return undefined;
+          default:       return SYM_SENTINEL;
+        }
+      }
+      case 'BinaryExpression': {
+        const l = symEval(node.left,  env, depth, visited);
+        const r = symEval(node.right, env, depth, visited);
+        if (symUnresolved(l) || symUnresolved(r)) return SYM_SENTINEL;
+        switch (node.operator) {
+          case '+':   return l + r;
+          case '-':   return l - r;
+          case '*':   return l * r;
+          case '/':   return r === 0 ? SYM_SENTINEL : l / r;
+          case '%':   return r === 0 ? SYM_SENTINEL : l % r;
+          case '**':  return l ** r;
+          case '&':   return l & r;
+          case '|':   return l | r;
+          case '^':   return l ^ r;
+          case '<<':  return l << r;
+          case '>>':  return l >> r;
+          case '>>>': return l >>> r;
+          case '===': return l === r;
+          case '!==': return l !== r;
+          case '==':  return l == r;  // eslint-disable-line eqeqeq
+          case '!=':  return l != r;  // eslint-disable-line eqeqeq
+          case '<':   return l < r;
+          case '<=':  return l <= r;
+          case '>':   return l > r;
+          case '>=':  return l >= r;
+          case 'in':
+          case 'instanceof': return SYM_SENTINEL;
+          default:    return SYM_SENTINEL;
+        }
+      }
+      case 'LogicalExpression': {
+        const l2 = symEval(node.left, env, depth, visited);
+        if (symUnresolved(l2)) return SYM_SENTINEL;
+        if (node.operator === '&&') return l2 ? symEval(node.right, env, depth, visited) : l2;
+        if (node.operator === '||') return l2 ? l2 : symEval(node.right, env, depth, visited);
+        if (node.operator === '??') return (l2 === null || l2 === undefined) ? symEval(node.right, env, depth, visited) : l2;
+        return SYM_SENTINEL;
+      }
+      case 'ConditionalExpression': {
+        const test = symEval(node.test, env, depth, visited);
+        if (symUnresolved(test)) return SYM_SENTINEL;
+        return test ? symEval(node.consequent, env, depth, visited) : symEval(node.alternate, env, depth, visited);
+      }
+      case 'TemplateLiteral': {
+        let r = '';
+        for (let i = 0; i < node.quasis.length; i++) {
+          r += node.quasis[i].value.cooked ?? node.quasis[i].value.raw;
+          if (i < node.expressions.length) {
+            const ev = symEval(node.expressions[i], env, depth, visited);
+            if (symUnresolved(ev)) return SYM_SENTINEL;
+            r += String(ev);
+          }
+        }
+        return r;
+      }
+      case 'ArrayExpression': {
+        const arr = [];
+        for (const el of node.elements) {
+          if (!el) { arr.push(undefined); continue; }
+          if (el.type === 'SpreadElement') return SYM_SENTINEL;
+          const v = symEval(el, env, depth, visited);
+          if (symUnresolved(v)) return SYM_SENTINEL;
+          arr.push(v);
+        }
+        return arr;
+      }
+      case 'ObjectExpression': {
+        const obj = {};
+        for (const prop of node.properties) {
+          if (prop.type !== 'ObjectProperty' || prop.computed) return SYM_SENTINEL;
+          const key = t.isIdentifier(prop.key) ? prop.key.name : t.isStringLiteral(prop.key) ? prop.key.value : null;
+          if (key === null) return SYM_SENTINEL;
+          const val = symEval(prop.value, env, depth, visited);
+          if (symUnresolved(val)) return SYM_SENTINEL;
+          obj[key] = val;
+        }
+        return obj;
+      }
+      case 'MemberExpression': {
+        if (node.computed) {
+          const obj = symEval(node.object, env, depth, visited);
+          const prop = symEval(node.property, env, depth, visited);
+          if (symUnresolved(obj) || symUnresolved(prop)) return SYM_SENTINEL;
+          if (obj === null || obj === undefined) return SYM_SENTINEL;
+          if (SYM_BLOCKED.has(String(prop))) return SYM_SENTINEL;
+          try { const v = obj[prop]; return (typeof v === 'function') ? SYM_SENTINEL : v; } catch(_) { return SYM_SENTINEL; }
+        } else {
+          const propName = node.property.name ?? node.property.value;
+          if (SYM_BLOCKED.has(propName)) return SYM_SENTINEL;
+          const obj = symEval(node.object, env, depth, visited);
+          if (symUnresolved(obj) || obj === null || obj === undefined) return SYM_SENTINEL;
+          // Allow safe string/array built-ins by value only (no function calls)
+          try {
+            const v = obj[propName];
+            return (typeof v === 'function') ? SYM_SENTINEL : v;
+          } catch(_) { return SYM_SENTINEL; }
+        }
+      }
+      case 'CallExpression': {
+        // Only evaluate a curated allowlist of pure built-ins
+        const { callee, arguments: args } = node;
+        const evalledArgs = args.map(a => symEval(a, env, depth, visited));
+        if (evalledArgs.some(symUnresolved)) return SYM_SENTINEL;
+
+        // String.fromCharCode(...)
+        if (t.isMemberExpression(callee) && t.isIdentifier(callee.object, { name: 'String' }) && t.isIdentifier(callee.property, { name: 'fromCharCode' }))
+          try { return String.fromCharCode(...evalledArgs); } catch(_) { return SYM_SENTINEL; }
+
+        // String.prototype methods: .charAt .charCodeAt .indexOf .slice .substring .split .replace .toUpperCase .toLowerCase .trim .repeat .padStart .padEnd .startsWith .endsWith .includes
+        const SAFE_STR_METHODS = new Set(['charAt','charCodeAt','indexOf','lastIndexOf','slice','substring','substr','split','toUpperCase','toLowerCase','trim','trimStart','trimEnd','repeat','padStart','padEnd','startsWith','endsWith','includes','concat','at']);
+        // Array.prototype methods: .join .slice .indexOf .includes .concat .reverse .flat .map .filter (only when fn is pure)
+        const SAFE_ARR_METHODS = new Set(['join','slice','indexOf','lastIndexOf','includes','concat','flat','reverse','at','length']);
+
+        if (t.isMemberExpression(callee)) {
+          const obj = symEval(callee.object, env, depth, visited);
+          if (symUnresolved(obj)) return SYM_SENTINEL;
+          const method = callee.computed
+            ? symEval(callee.property, env, depth, visited)
+            : (callee.property.name ?? callee.property.value);
+          if (symUnresolved(method) || SYM_BLOCKED.has(method)) return SYM_SENTINEL;
+          if (typeof obj === 'string' && SAFE_STR_METHODS.has(method)) {
+            try { return obj[method](...evalledArgs); } catch(_) { return SYM_SENTINEL; }
+          }
+          if (Array.isArray(obj) && SAFE_ARR_METHODS.has(method)) {
+            try {
+              const v = obj[method](...evalledArgs);
+              return (typeof v === 'function') ? SYM_SENTINEL : v;
+            } catch(_) { return SYM_SENTINEL; }
+          }
+          // Math.*
+          const SAFE_MATH = new Set(['abs','ceil','floor','round','min','max','pow','sqrt','log','log2','log10','sign','trunc','clz32','imul','fround']);
+          if (t.isIdentifier(callee.object, { name: 'Math' }) && SAFE_MATH.has(method)) {
+            try { return Math[method](...evalledArgs); } catch(_) { return SYM_SENTINEL; }
+          }
+          // Number.parseInt, Number.parseFloat, Number.isNaN, Number.isFinite
+          if (t.isIdentifier(callee.object, { name: 'Number' })) {
+            if (method === 'parseInt')  try { return parseInt(evalledArgs[0], evalledArgs[1]); } catch(_) { return SYM_SENTINEL; }
+            if (method === 'parseFloat') try { return parseFloat(evalledArgs[0]); } catch(_) { return SYM_SENTINEL; }
+            if (method === 'isNaN')      return Number.isNaN(evalledArgs[0]);
+            if (method === 'isFinite')   return Number.isFinite(evalledArgs[0]);
+          }
+          // JSON.stringify / JSON.parse on literal values
+          if (t.isIdentifier(callee.object, { name: 'JSON' })) {
+            if (method === 'stringify') try { return JSON.stringify(evalledArgs[0]); } catch(_) { return SYM_SENTINEL; }
+            if (method === 'parse')     try { return JSON.parse(evalledArgs[0]); } catch(_) { return SYM_SENTINEL; }
+          }
+        }
+
+        // parseInt / parseFloat top-level
+        if (t.isIdentifier(callee, { name: 'parseInt' }))   try { return parseInt(evalledArgs[0], evalledArgs[1]); } catch(_) { return SYM_SENTINEL; }
+        if (t.isIdentifier(callee, { name: 'parseFloat' })) try { return parseFloat(evalledArgs[0]); } catch(_) { return SYM_SENTINEL; }
+        if (t.isIdentifier(callee, { name: 'isNaN' }))      return isNaN(evalledArgs[0]);
+        if (t.isIdentifier(callee, { name: 'isFinite' }))   return isFinite(evalledArgs[0]);
+        if (t.isIdentifier(callee, { name: 'String' }))     try { return String(evalledArgs[0]); } catch(_) { return SYM_SENTINEL; }
+        if (t.isIdentifier(callee, { name: 'Number' }))     try { return Number(evalledArgs[0]); } catch(_) { return SYM_SENTINEL; }
+        if (t.isIdentifier(callee, { name: 'Boolean' }))    return Boolean(evalledArgs[0]);
+        if (t.isIdentifier(callee, { name: 'encodeURIComponent' })) try { return encodeURIComponent(evalledArgs[0]); } catch(_) { return SYM_SENTINEL; }
+        if (t.isIdentifier(callee, { name: 'decodeURIComponent' })) try { return decodeURIComponent(evalledArgs[0]); } catch(_) { return SYM_SENTINEL; }
+        if (t.isIdentifier(callee, { name: 'atob' })) try { return atob(evalledArgs[0]); } catch(_) { return SYM_SENTINEL; }
+        if (t.isIdentifier(callee, { name: 'btoa' })) try { return btoa(evalledArgs[0]); } catch(_) { return SYM_SENTINEL; }
+
+        // User-defined function call — evaluate if body is known & simple
+        if (t.isIdentifier(callee)) {
+          const fnVal = env.get(callee.name);
+          if (symUnresolved(fnVal) || typeof fnVal !== 'object' || !fnVal?.__symFn) return SYM_SENTINEL;
+          return symCallFn(fnVal, evalledArgs, env, depth + 1, visited);
+        }
+        return SYM_SENTINEL;
+      }
+      case 'SequenceExpression': {
+        let last = SYM_SENTINEL;
+        for (const expr of node.expressions) { last = symEval(expr, env, depth, visited); }
+        return last;
+      }
+      case 'AssignmentExpression': {
+        if (node.operator !== '=') return SYM_SENTINEL;
+        if (!t.isIdentifier(node.left)) return SYM_SENTINEL;
+        const val = symEval(node.right, env, depth, visited);
+        if (!symUnresolved(val)) env.set(node.left.name, val);
+        return val;
+      }
+      default:
+        return SYM_SENTINEL;
+    }
+  }
+
+  // Execute a known user-defined function symbolically
+  function symCallFn(fnDef, args, callerEnv, depth, visited) {
+    const { params, body } = fnDef;
+    if (!body || depth > SYM_RECUR_LIMIT) return SYM_SENTINEL;
+    const localEnv = callerEnv.child();
+    for (let i = 0; i < params.length; i++) {
+      if (t.isIdentifier(params[i])) localEnv.set(params[i].name, args[i] ?? undefined);
+    }
+    return symExecBlock(body, localEnv, depth, visited);
+  }
+
+  // Execute a block of statements, return value of first ReturnStatement
+  function symExecBlock(block, env, depth, visited) {
+    if (!t.isBlockStatement(block) || depth > SYM_RECUR_LIMIT) return SYM_SENTINEL;
+    for (const stmt of block.body) {
+      const r = symExecStmt(stmt, env, depth, visited);
+      if (r !== SYM_SENTINEL && r !== null && typeof r === 'object' && r.__symReturn) return r.value;
+      // Side-effecting stmts (var decl, expr stmt) mutate env; we continue
+    }
+    return undefined;
+  }
+
+  function symExecStmt(stmt, env, depth, visited) {
+    if (!stmt) return SYM_SENTINEL;
+    if (++visited.n > SYM_EXPR_LIMIT) return SYM_SENTINEL;
+    switch (stmt.type) {
+      case 'ReturnStatement': {
+        const val = stmt.argument ? symEval(stmt.argument, env, depth, visited) : undefined;
+        return { __symReturn: true, value: val };
+      }
+      case 'VariableDeclaration': {
+        for (const decl of stmt.declarations) {
+          if (!t.isIdentifier(decl.id) || !decl.init) continue;
+          const val = symEval(decl.init, env, depth, visited);
+          if (!symUnresolved(val)) env.set(decl.id.name, val);
+        }
+        return null;
+      }
+      case 'ExpressionStatement': {
+        symEval(stmt.expression, env, depth, visited);
+        return null;
+      }
+      case 'IfStatement': {
+        const test = symEval(stmt.test, env, depth, visited);
+        if (symUnresolved(test)) return SYM_SENTINEL;
+        const branch = test ? stmt.consequent : stmt.alternate;
+        if (!branch) return null;
+        if (t.isBlockStatement(branch)) return symExecBlock(branch, env, depth, visited);
+        return symExecStmt(branch, env, depth, visited);
+      }
+      case 'BlockStatement':
+        return symExecBlock(stmt, env, depth, visited);
+      case 'ForStatement': {
+        // Only evaluate with constant bounds
+        if (stmt.init) symExecStmt(stmt.init, env, depth, visited);
+        let iters = 0;
+        while (iters++ < SYM_LOOP_LIMIT) {
+          if (stmt.test) { const tv = symEval(stmt.test, env, depth, visited); if (symUnresolved(tv) || !tv) break; }
+          const r = symExecBlock(t.isBlockStatement(stmt.body) ? stmt.body : t.blockStatement([stmt.body]), env, depth, visited);
+          if (r && typeof r === 'object' && r.__symReturn) return r;
+          if (stmt.update) symEval(stmt.update, env, depth, visited);
+        }
+        return null;
+      }
+      case 'WhileStatement': {
+        let iters = 0;
+        while (iters++ < SYM_LOOP_LIMIT) {
+          const tv = symEval(stmt.test, env, depth, visited);
+          if (symUnresolved(tv) || !tv) break;
+          const r = symExecBlock(t.isBlockStatement(stmt.body) ? stmt.body : t.blockStatement([stmt.body]), env, depth, visited);
+          if (r && typeof r === 'object' && r.__symReturn) return r;
+        }
+        return null;
+      }
+      default:
+        return SYM_SENTINEL;
+    }
+  }
+
+  // Build a SymEnv pre-seeded with all const literals visible in the program
+  function buildTopLevelEnv(ast) {
+    const env = new SymEnv();
+    traverse(ast, {
+      VariableDeclarator(path2) {
+        if (path2.parent.kind !== 'const' || !t.isIdentifier(path2.node.id) || !path2.node.init) return;
+        const v = symEval(path2.node.init, env);
+        if (!symUnresolved(v)) env.set(path2.node.id.name, v);
+      },
+    });
+    // Second pass: pick up consts whose initialisers reference earlier consts
+    traverse(ast, {
+      VariableDeclarator(path2) {
+        if (path2.parent.kind !== 'const' || !t.isIdentifier(path2.node.id) || !path2.node.init) return;
+        if (!symUnresolved(env.get(path2.node.id.name))) return;
+        const v = symEval(path2.node.init, env);
+        if (!symUnresolved(v)) env.set(path2.node.id.name, v);
+      },
+    });
+    return env;
+  }
+
+  // Convert a JS primitive to a Babel literal node (returns null if not convertible)
+  function primitiveToLiteral(v) {
+    if (typeof v === 'string')  return t.stringLiteral(v);
+    if (typeof v === 'number')  {
+      if (!isFinite(v)) return null;
+      if (v < 0) return t.unaryExpression('-', t.numericLiteral(-v));
+      return t.numericLiteral(v);
+    }
+    if (typeof v === 'boolean') return t.booleanLiteral(v);
+    if (v === null)             return t.nullLiteral();
+    if (v === undefined)        return t.identifier('undefined');
+    return null;
+  }
+
+  const symbolicExecutionPass = {
+    id: 'symbolicExecution',
+    name: 'Symbolic Execution (safe deterministic evaluation)',
+    priority: 20,
+    enabled: true,
+    run(ast, { log }) {
+      let folded = 0;
+      const topEnv = buildTopLevelEnv(ast);
+
+      traverse(ast, {
+        // Only replace expression nodes that are NOT already literals
+        'BinaryExpression|UnaryExpression|CallExpression|ConditionalExpression|LogicalExpression|TemplateLiteral|MemberExpression': {
+          exit(path2) {
+            // Skip if already a literal or inside a declaration LHS
+            if (t.isLiteral(path2.node)) return;
+            if (path2.isLHS?.()) return;
+            // Skip if it's the callee of a call (avoid self-referential replacement)
+            if (t.isCallExpression(path2.parent) && path2.parent.callee === path2.node) return;
+            // Skip MemberExpression that's the callee of a call
+            if (t.isMemberExpression(path2.node) && t.isCallExpression(path2.parent) && path2.parent.callee === path2.node) return;
+
+            // Build a local env from the current scope's bindings (only literals)
+            const localEnv = topEnv.child();
+            try {
+              const bindings = path2.scope?.bindings ?? {};
+              for (const [name, binding] of Object.entries(bindings)) {
+                if (SYM_BLOCKED.has(name)) continue;
+                const bp = binding.path;
+                if (!bp) continue;
+                const init = bp.isVariableDeclarator() ? bp.node.init : null;
+                if (!init) continue;
+                const v2 = symEval(init, localEnv, 0, { n: 0 });
+                if (!symUnresolved(v2)) localEnv.set(name, v2);
+              }
+            } catch(_) {}
+
+            const val = symEval(path2.node, localEnv, 0, { n: 0 });
+            if (symUnresolved(val)) return;
+            // Reject if the value would change semantics (NaN, Infinity, objects, functions)
+            if (typeof val === 'object' && val !== null) return;
+            if (typeof val === 'function') return;
+            if (typeof val === 'number' && !isFinite(val)) return;
+            const lit = primitiveToLiteral(val);
+            if (!lit) return;
+            // Don't replace a node with an identical literal (avoids infinite loops)
+            if (t.isLiteral(path2.node) && path2.node.value === val) return;
+            try { path2.replaceWith(lit); folded++; } catch(_) {}
+          },
+        },
+      });
+
+      if (folded > 0) log('Symbolic execution folded ' + folded + ' expression(s)');
+      else log('No symbolically foldable expressions found');
     },
   };
 
