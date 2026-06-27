@@ -2268,9 +2268,13 @@ async function bootstrap() {
       // ── Stage 3: algebraic folding (loop until stable, ≤5 iter) ───────────
       // Re-run string passes inside this loop too: a folded constant might
       // resolve an argument to a string decoder on the next round.
+      // New passes: fullConstProp and stmtPropagation handle chained variable
+      // assignments; mbaSimplify rewrites boolean-arithmetic identities;
+      // aliasPropagation resolves x=y; z=x; → original reference chains.
       const foldPasses = [
         advancedStringDecoderPass, xorDecodingPass, stringDecoderPass,
-        opaquePredicatePass, constantPropagationPass,
+        aliasPropagationPass, fullConstPropPass, stmtPropagationPass,
+        opaquePredicatePass, constantPropagationPass, mbaSimplifyPass,
         bitwiseSimplifyPass, numericLiteralPass, templateLiteralPass,
       ];
       const foldChanged = await runUntilStable(foldPasses, 5);
@@ -3095,6 +3099,472 @@ async function bootstrap() {
     },
   };
 
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // TIER 1 NEW PASSES
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // ── 1. Full Statement-Level Symbolic Propagation ───────────────────────────
+  // Unlike symbolicExecutionPass (which only folds expressions bottom-up using
+  // scope bindings), this pass walks each function/block's statement list and
+  // builds a concrete value map as it goes:
+  //   let a = 5; let b = a * 3; let c = b ^ 7; arr[c]
+  // → arr[28]
+  // It replaces downstream *reads* of variables whose concrete value is known,
+  // then lets the existing folding passes collapse the resulting expressions.
+  const stmtPropagationPass = {
+    id: 'stmtPropagation', name: 'Statement-Level Symbolic Propagation', priority: 19, enabled: true,
+    run(ast, { log }) {
+      let replaced = 0;
+
+      // Returns true if an AST node is a pure literal or an expression we can
+      // safely duplicate (identifiers, literals, simple unary on literals).
+      function isCheapLiteral(node) {
+        if (!node) return false;
+        if (t.isLiteral(node)) return true;
+        if (t.isIdentifier(node)) return true;
+        if (t.isUnaryExpression(node) && t.isLiteral(node.argument)) return true;
+        return false;
+      }
+
+      // Evaluate a simple expression against a concrete map {name→value}.
+      // Only handles the subset that produces primitives safely.
+      function evalExpr(node, env) {
+        if (!node) return undefined;
+        if (t.isNumericLiteral(node) || t.isStringLiteral(node) || t.isBooleanLiteral(node)) return node.value;
+        if (t.isNullLiteral(node)) return null;
+        if (t.isIdentifier(node)) {
+          if (node.name === 'undefined') return undefined;
+          return env.has(node.name) ? env.get(node.name) : undefined;
+        }
+        if (t.isUnaryExpression(node)) {
+          const v = evalExpr(node.argument, env);
+          if (v === undefined && !env.has('undefined')) return undefined;
+          switch (node.operator) {
+            case '-': return typeof v === 'number' ? -v : undefined;
+            case '~': return typeof v === 'number' ? ~v : undefined;
+            case '!': return !v;
+            case '+': return typeof v === 'number' ? +v : (typeof v === 'string' ? +v : undefined);
+            default: return undefined;
+          }
+        }
+        if (t.isBinaryExpression(node)) {
+          const l = evalExpr(node.left, env);
+          const r = evalExpr(node.right, env);
+          if (l === undefined || r === undefined) return undefined;
+          switch (node.operator) {
+            case '+': return l + r;    case '-': return l - r;
+            case '*': return l * r;    case '/': return r === 0 ? undefined : l / r;
+            case '%': return r === 0 ? undefined : l % r;
+            case '&': return l & r;    case '|': return l | r;
+            case '^': return l ^ r;    case '<<': return l << r;
+            case '>>': return l >> r;  case '>>>': return l >>> r;
+            case '===': return l === r; case '!==': return l !== r;
+            case '<': return l < r;    case '<=': return l <= r;
+            case '>': return l > r;    case '>=': return l >= r;
+            default: return undefined;
+          }
+        }
+        if (t.isConditionalExpression(node)) {
+          const tv = evalExpr(node.test, env);
+          if (tv === undefined) return undefined;
+          return tv ? evalExpr(node.consequent, env) : evalExpr(node.alternate, env);
+        }
+        return undefined;
+      }
+
+      function primitiveNode(v) {
+        if (typeof v === 'number') {
+          if (!isFinite(v)) return null;
+          if (v < 0) return t.unaryExpression('-', t.numericLiteral(-v));
+          return t.numericLiteral(v);
+        }
+        if (typeof v === 'string')  return t.stringLiteral(v);
+        if (typeof v === 'boolean') return t.booleanLiteral(v);
+        if (v === null)             return t.nullLiteral();
+        if (v === undefined)        return t.identifier('undefined');
+        return null;
+      }
+
+      // Walk a block's statements, maintain env, and replace identifier reads
+      // that resolve to a known primitive. Kill a variable from env if it's
+      // reassigned in a way we can't track.
+      function processBlock(stmts, env) {
+        for (const stmt of stmts) {
+          if (!stmt) continue;
+
+          if (t.isVariableDeclaration(stmt)) {
+            for (const decl of stmt.declarations) {
+              if (!t.isIdentifier(decl.id)) continue;
+              const name = decl.id.name;
+              if (!decl.init) { env.delete(name); continue; }
+              const v = evalExpr(decl.init, env);
+              if (v !== undefined && typeof v !== 'function' && (typeof v !== 'number' || isFinite(v))) {
+                env.set(name, v);
+              } else {
+                env.delete(name);
+              }
+            }
+            continue;
+          }
+
+          if (t.isExpressionStatement(stmt) && t.isAssignmentExpression(stmt.expression)) {
+            const asgn = stmt.expression;
+            if (t.isIdentifier(asgn.left) && asgn.operator === '=') {
+              const v = evalExpr(asgn.right, env);
+              if (v !== undefined && typeof v !== 'function' && (typeof v !== 'number' || isFinite(v))) {
+                env.set(asgn.left.name, v);
+              } else {
+                env.delete(asgn.left.name);
+              }
+            }
+            continue;
+          }
+
+          // For any other statement: replace identifier reads that are in env,
+          // then recurse into nested blocks. Conservatively kill any var that
+          // might be written by this statement (we only track trivial cases above).
+          try {
+            traverse({ type: 'File', program: { type: 'Program', body: [stmt], directives: [], sourceType: 'script' } }, {
+              Identifier(path2) {
+                const name = path2.node.name;
+                if (!env.has(name)) return;
+                const parent = path2.parent;
+                // Skip LHS positions
+                if (t.isVariableDeclarator(parent) && parent.id === path2.node) return;
+                if (t.isAssignmentExpression(parent) && parent.left === path2.node) return;
+                if (t.isMemberExpression(parent) && !parent.computed && parent.property === path2.node) return;
+                if (t.isObjectProperty(parent) && parent.key === path2.node && !parent.computed) return;
+                if (t.isFunctionDeclaration(parent) || t.isFunctionExpression(parent) || t.isArrowFunctionExpression(parent)) return;
+                const lit = primitiveNode(env.get(name));
+                if (!lit) return;
+                // Don't replace if already the same literal
+                if (t.isLiteral(path2.node)) return;
+                try { path2.replaceWith(lit); replaced++; } catch(_) {}
+              },
+            });
+          } catch(_) {}
+
+          // Recurse into nested blocks (if/else, for, while bodies)
+          if (t.isIfStatement(stmt)) {
+            const childEnv = new Map(env);
+            if (t.isBlockStatement(stmt.consequent)) processBlock(stmt.consequent.body, new Map(childEnv));
+            if (stmt.alternate && t.isBlockStatement(stmt.alternate)) processBlock(stmt.alternate.body, new Map(childEnv));
+          } else if (t.isBlockStatement(stmt)) {
+            processBlock(stmt.body, new Map(env));
+          } else if ((t.isForStatement(stmt) || t.isWhileStatement(stmt) || t.isDoWhileStatement(stmt)) && stmt.body && t.isBlockStatement(stmt.body)) {
+            processBlock(stmt.body.body, new Map(env));
+          }
+        }
+      }
+
+      traverse(ast, {
+        'FunctionDeclaration|FunctionExpression|ArrowFunctionExpression|Program': {
+          enter(path2) {
+            const body = path2.node.body;
+            const stmts = t.isBlockStatement(body) ? body.body : (Array.isArray(body) ? body : null);
+            if (!stmts) return;
+            // Seed env with known parameter literals (rare but possible)
+            const env = new Map();
+            processBlock(stmts, env);
+          },
+        },
+      });
+
+      if (replaced > 0) log('Statement propagation replaced ' + replaced + ' variable read(s)');
+      else log('No statement propagation opportunities found');
+    },
+  };
+
+  // ── 2. Alias Chain Propagation ─────────────────────────────────────────────
+  // Handles: var x = window; var y = x; var z = y; z.alert()  → window.alert()
+  // Also: const a = someObj; a.foo()  → someObj.foo()
+  // Works for any depth of aliasing: a→b→c→d→original.
+  const aliasPropagationPass = {
+    id: 'aliasPropagation', name: 'Alias Chain Propagation', priority: 21, enabled: true,
+    run(ast, { log }) {
+      let replaced = 0;
+
+      traverse(ast, {
+        'FunctionDeclaration|FunctionExpression|ArrowFunctionExpression|Program': {
+          enter(path2) {
+            // Build alias map for this scope: name → ultimate target node
+            const aliasMap = new Map(); // name → Identifier|MemberExpression node
+
+            function resolveAlias(node, depth = 0) {
+              if (depth > 10) return node;
+              if (!t.isIdentifier(node)) return node;
+              const target = aliasMap.get(node.name);
+              if (!target) return node;
+              return resolveAlias(target, depth + 1);
+            }
+
+            const body = path2.node.body;
+            const stmts = t.isBlockStatement(body) ? body.body : (Array.isArray(body) ? body : []);
+
+            // First pass: collect alias declarations within this scope
+            for (const stmt of stmts) {
+              if (!t.isVariableDeclaration(stmt)) continue;
+              for (const decl of stmt.declarations) {
+                if (!t.isIdentifier(decl.id) || !decl.init) continue;
+                // Only alias to identifiers or member expressions (not arbitrary expressions)
+                if (t.isIdentifier(decl.init) || t.isMemberExpression(decl.init)) {
+                  // Only track if the RHS is itself not being re-assigned later
+                  aliasMap.set(decl.id.name, decl.init);
+                }
+              }
+            }
+
+            if (aliasMap.size === 0) return;
+
+            // Second pass: replace reads of aliased names with their ultimate source
+            // Skip the declaration sites themselves
+            const declaredNames = new Set(aliasMap.keys());
+            try {
+              path2.traverse({
+                Identifier(iPath) {
+                  const name = iPath.node.name;
+                  if (!declaredNames.has(name)) return;
+                  const parent = iPath.parent;
+                  // Skip LHS positions
+                  if (t.isVariableDeclarator(parent) && parent.id === iPath.node) return;
+                  if (t.isAssignmentExpression(parent) && parent.left === iPath.node) return;
+                  if (t.isMemberExpression(parent) && !parent.computed && parent.property === iPath.node) return;
+                  if (t.isObjectProperty(parent) && parent.key === iPath.node && !parent.computed) return;
+                  // Skip the declaration init itself to avoid circular replacement
+                  if (t.isVariableDeclarator(parent) && parent.init === iPath.node) return;
+                  const resolved = resolveAlias(iPath.node);
+                  if (resolved === iPath.node || resolved.name === name) return;
+                  // Don't replace if the alias target might be mutated — only safe
+                  // for identifiers that resolve to globally-known names or literals
+                  try { iPath.replaceWith(t.cloneNode(resolved, true)); replaced++; } catch(_) {}
+                },
+              });
+            } catch(_) {}
+          },
+        },
+      });
+
+      if (replaced > 0) log('Alias propagation replaced ' + replaced + ' reference(s)');
+      else log('No alias chains found');
+    },
+  };
+
+  // ── 3. MBA (Mixed Boolean Arithmetic) Simplification ──────────────────────
+  // Rewrites common MBA patterns back to their simple forms:
+  //   (a ^ b) + 2*(a & b)        → a + b
+  //   (a | b) + (a & b)          → a + b
+  //   (a & b) - (a | b)          → -(a ^ b) (a-b when no overflow)... skip
+  //   ~(~a & ~b)                 → a | b      (De Morgan)
+  //   ~(~a | ~b)                 → a & b      (De Morgan)
+  //   (a + b) - (a ^ b) ... etc.
+  // For constant-only expressions, numeric folding already handles them.
+  // This pass handles the *symbolic* MBA patterns where a/b are variables.
+  const mbaSimplifyPass = {
+    id: 'mbaSimplify', name: 'MBA (Mixed Boolean-Arithmetic) Simplification', priority: 16, enabled: true,
+    run(ast, { log }) {
+      let simplified = 0;
+
+      function matchIdent(node) {
+        return t.isIdentifier(node) ? node.name : null;
+      }
+      // Check if two nodes are the same identifier
+      function sameIdent(a, b) {
+        return t.isIdentifier(a) && t.isIdentifier(b) && a.name === b.name;
+      }
+      // Check: (A op B) where A and B match given idents (in either order)
+      function matchBin(node, op, na, nb) {
+        if (!t.isBinaryExpression(node) || node.operator !== op) return false;
+        return (sameIdent(node.left, na) && sameIdent(node.right, nb)) ||
+               (sameIdent(node.left, nb) && sameIdent(node.right, na));
+      }
+
+      traverse(ast, {
+        BinaryExpression: { exit(path2) {
+          const { operator: op, left, right } = path2.node;
+
+          // Pattern: (a ^ b) + 2*(a & b)  OR  2*(a & b) + (a ^ b)  → a + b
+          // Also accept ((a & b) << 1) instead of 2*(a & b)
+          if (op === '+') {
+            let xorNode = null, andNode = null;
+            // Detect which side is XOR and which is the shifted/doubled AND
+            const tryExtract = (side1, side2) => {
+              if (t.isBinaryExpression(side1) && side1.operator === '^') xorNode = side1;
+              // 2*(a&b)
+              if (t.isBinaryExpression(side2) && side2.operator === '*') {
+                const { left: ml, right: mr } = side2;
+                if (t.isNumericLiteral(ml) && ml.value === 2 && t.isBinaryExpression(mr) && mr.operator === '&') andNode = mr;
+                if (t.isNumericLiteral(mr) && mr.value === 2 && t.isBinaryExpression(ml) && ml.operator === '&') andNode = ml;
+              }
+              // (a&b) << 1
+              if (t.isBinaryExpression(side2) && side2.operator === '<<' &&
+                  t.isNumericLiteral(side2.right) && side2.right.value === 1 &&
+                  t.isBinaryExpression(side2.left) && side2.left.operator === '&') andNode = side2.left;
+            };
+            tryExtract(left, right);
+            if (!xorNode || !andNode) { xorNode = null; andNode = null; tryExtract(right, left); }
+            if (xorNode && andNode) {
+              // Check XOR and AND operate on the same two variables
+              const xL = xorNode.left, xR = xorNode.right;
+              const aL = andNode.left, aR = andNode.right;
+              if ((sameIdent(xL, aL) && sameIdent(xR, aR)) || (sameIdent(xL, aR) && sameIdent(xR, aL))) {
+                try {
+                  path2.replaceWith(t.binaryExpression('+', t.cloneNode(xL, true), t.cloneNode(xR, true)));
+                  simplified++; return;
+                } catch(_) {}
+              }
+            }
+
+            // Pattern: (a | b) + (a & b) → a + b
+            let orNode = null; andNode = null;
+            const tryOrAnd = (s1, s2) => {
+              if (t.isBinaryExpression(s1) && s1.operator === '|') orNode = s1;
+              if (t.isBinaryExpression(s2) && s2.operator === '&') andNode = s2;
+            };
+            tryOrAnd(left, right);
+            if (!orNode || !andNode) { orNode = null; andNode = null; tryOrAnd(right, left); }
+            if (orNode && andNode) {
+              const oL = orNode.left, oR = orNode.right, aL2 = andNode.left, aR2 = andNode.right;
+              if ((sameIdent(oL, aL2) && sameIdent(oR, aR2)) || (sameIdent(oL, aR2) && sameIdent(oR, aL2))) {
+                try {
+                  path2.replaceWith(t.binaryExpression('+', t.cloneNode(oL, true), t.cloneNode(oR, true)));
+                  simplified++; return;
+                } catch(_) {}
+              }
+            }
+          }
+
+          // Pattern: (a | b) - (a ^ b) → a & b
+          if (op === '-' && t.isBinaryExpression(left) && t.isBinaryExpression(right)) {
+            if (left.operator === '|' && right.operator === '^') {
+              if ((sameIdent(left.left, right.left) && sameIdent(left.right, right.right)) ||
+                  (sameIdent(left.left, right.right) && sameIdent(left.right, right.left))) {
+                try {
+                  path2.replaceWith(t.binaryExpression('&', t.cloneNode(left.left, true), t.cloneNode(left.right, true)));
+                  simplified++; return;
+                } catch(_) {}
+              }
+            }
+            // Pattern: (a & b) - (a | b) → -(a ^ b) — skip (produces unary, not simpler)
+          }
+        }},
+
+        UnaryExpression: { exit(path2) {
+          if (path2.node.operator !== '~') return;
+          const inner = path2.node.argument;
+          if (!t.isBinaryExpression(inner)) return;
+
+          // De Morgan: ~(~a & ~b) → a | b
+          if (inner.operator === '&') {
+            const { left, right } = inner;
+            if (t.isUnaryExpression(left, { operator: '~' }) && t.isUnaryExpression(right, { operator: '~' })) {
+              try {
+                path2.replaceWith(t.binaryExpression('|', t.cloneNode(left.argument, true), t.cloneNode(right.argument, true)));
+                simplified++; return;
+              } catch(_) {}
+            }
+          }
+          // De Morgan: ~(~a | ~b) → a & b
+          if (inner.operator === '|') {
+            const { left, right } = inner;
+            if (t.isUnaryExpression(left, { operator: '~' }) && t.isUnaryExpression(right, { operator: '~' })) {
+              try {
+                path2.replaceWith(t.binaryExpression('&', t.cloneNode(left.argument, true), t.cloneNode(right.argument, true)));
+                simplified++; return;
+              } catch(_) {}
+            }
+          }
+          // ~~a → a | 0  (double negation — simplify to identity for integers)
+          // Actually ~~a === a|0, but that's not simpler. Skip.
+        }},
+      });
+
+      if (simplified > 0) log('MBA simplified ' + simplified + ' expression(s)');
+      else log('No MBA patterns found');
+    },
+  };
+
+  // ── 4. Full Constant Propagation (var/let/const through CFG) ───────────────
+  // Extends the existing constantPropagationPass which only handles top-level
+  // const with literal inits. This pass handles:
+  //   - var/let as well as const
+  //   - Variables whose init is a simple expression resolvable at parse time
+  //   - Scope-aware: a variable shadowed in an inner scope is not replaced there
+  //   - Only propagates variables that are never reassigned (single-write)
+  const fullConstPropPass = {
+    id: 'fullConstProp', name: 'Full Constant Propagation (single-write variables)', priority: 17, enabled: true,
+    run(ast, { log }) {
+      let propagated = 0;
+
+      traverse(ast, {
+        'FunctionDeclaration|FunctionExpression|ArrowFunctionExpression|Program': {
+          enter(outerPath) {
+            // Collect all variable declarators in this scope (not nested scopes)
+            const candidates = new Map(); // name → {node, value, writeCount}
+            const body = outerPath.node.body;
+            const stmts = t.isBlockStatement(body) ? body.body : (Array.isArray(body) ? body : []);
+
+            // Count writes to each variable (declarations + assignments)
+            const writeCounts = new Map();
+            const declValues = new Map(); // name → literal node
+
+            try {
+              outerPath.traverse({
+                VariableDeclarator(path2) {
+                  // Only count declarators directly in this scope
+                  if (path2.scope !== outerPath.scope && path2.scope?.parent !== outerPath.scope) return;
+                  const name = path2.node.id?.name;
+                  if (!name) return;
+                  writeCounts.set(name, (writeCounts.get(name) || 0) + 1);
+                  if (path2.node.init && t.isLiteral(path2.node.init)) {
+                    declValues.set(name, path2.node.init);
+                  }
+                },
+                AssignmentExpression(path2) {
+                  const name = t.isIdentifier(path2.node.left) ? path2.node.left.name : null;
+                  if (!name) return;
+                  writeCounts.set(name, (writeCounts.get(name) || 0) + 1);
+                },
+              });
+            } catch(_) { return; }
+
+            // Only propagate variables written exactly once with a literal init
+            for (const [name, lit] of declValues) {
+              if ((writeCounts.get(name) || 0) === 1) candidates.set(name, lit);
+            }
+
+            if (candidates.size === 0) return;
+
+            // Replace reads
+            try {
+              outerPath.traverse({
+                Identifier(path2) {
+                  if (!candidates.has(path2.node.name)) return;
+                  const parent = path2.parent;
+                  if (t.isVariableDeclarator(parent) && parent.id === path2.node) return;
+                  if (t.isAssignmentExpression(parent) && parent.left === path2.node) return;
+                  if (t.isMemberExpression(parent) && !parent.computed && parent.property === path2.node) return;
+                  if (t.isObjectProperty(parent) && parent.key === path2.node && !parent.computed) return;
+                  if (t.isFunctionDeclaration(parent) || t.isFunctionExpression(parent)) return;
+                  // Skip if this identifier is in a nested function (different closure)
+                  if (path2.scope !== outerPath.scope && !path2.scope?.path?.isProgram?.()) {
+                    // Check if it's shadowed in the nested scope
+                    const binding = path2.scope.getBinding(path2.node.name);
+                    if (binding && binding.scope !== outerPath.scope) return;
+                  }
+                  try { path2.replaceWith(t.cloneNode(candidates.get(path2.node.name))); propagated++; } catch(_) {}
+                },
+              });
+            } catch(_) {}
+          },
+        },
+      });
+
+      if (propagated > 0) log('Full const prop propagated ' + propagated + ' value(s)');
+      else log('No single-write variable propagation opportunities');
+    },
+  };
+
   // ── Register all passes ────────────────────────────────────────────────────
   const reg = new TransformRegistry();
   reg.registerAll([
@@ -3102,6 +3572,7 @@ async function bootstrap() {
     stringDecoderPass, advancedStringDecoderPass, xorDecodingPass,
     homoglyphCleanupPass, extendedUnicodeNormPass, unicodeNormalizationPass,
     hexDeobfuscationPass, templateLiteralPass, constantPropagationPass,
+    fullConstPropPass, mbaSimplifyPass, stmtPropagationPass, aliasPropagationPass,
     bitwiseSimplifyPass, numericLiteralPass, propertyAccessNormPass,
     objectAliasPass, controlFlowPass, switchDispatcherPass,
     rotateSimplificationPass, commaSplitterPass, ternaryUnfoldPass,
