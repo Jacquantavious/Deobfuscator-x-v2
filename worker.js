@@ -941,10 +941,69 @@ async function bootstrap() {
     return { kind: 'none' };
   }
 
+  // ── Helper: recursive transition-TREE extractor ───────────────────────────────
+  // Unlike extractTransition (which only looks at the trailing statement of a
+  // flat list), this walks into IfStatements so that a case body like:
+  //
+  //   if (cond) { state = 3; } else { state = 7; }
+  //
+  // is recognised as a *branch* node carrying two independent successors,
+  // rather than being missed entirely (the old code only ever saw the
+  // top-level statement list, found an IfStatement instead of a trailing
+  // assignment/return, and fell back to `{ kind: 'none' }`, silently
+  // dropping the branch).
+  //
+  // Returns a small tree:
+  //   leaf:   { kind: 'assign'|'return'|'break'|'continue'|'none', value? }
+  //   branch: { kind: 'branch', test, consequent: <tree>, alternate: <tree> }
+  //
+  // `prefix` collects the non-transition statements encountered before the
+  // branch point so the caller can emit them ahead of the reconstructed
+  // if/else. Statements *inside* each arm are intentionally left untouched
+  // here (the structurer re-derives them from the original consequent /
+  // alternate blocks) — extractTransitionsDeep only needs to know *where*
+  // control goes, not duplicate the statement bodies.
+  function extractTransitionsDeep(stmts, stateVarName) {
+    // Find the first IfStatement that is the LAST meaningful statement of
+    // this list (i.e. nothing after it but the implicit fallthrough) AND
+    // whose branches are themselves fully resolvable to transitions. If no
+    // such branch point exists, fall back to the flat extractTransition.
+    for (let i = stmts.length - 1; i >= 0; i--) {
+      const s = stmts[i];
+      // Once we hit a leaf transition before finding an IfStatement, stop —
+      // the flat extractor already covers this case correctly.
+      if (t.isReturnStatement(s) || t.isBreakStatement(s) || t.isContinueStatement(s)) break;
+      if (t.isExpressionStatement(s) && t.isAssignmentExpression(s.expression)) {
+        const { left, operator } = s.expression;
+        if (operator === '=' && t.isIdentifier(left) && left.name === stateVarName) break;
+      }
+      if (t.isIfStatement(s)) {
+        // Only treat this as a structurable branch if it's the LAST
+        // statement in the list (no statements after the if/else that
+        // would execute unconditionally regardless of which arm ran).
+        if (i !== stmts.length - 1) continue;
+        const consBlock = t.isBlockStatement(s.consequent) ? s.consequent.body : [s.consequent];
+        const altBlock = s.alternate ? (t.isBlockStatement(s.alternate) ? s.alternate.body : [s.alternate]) : [];
+        const consTrans = extractTransitionsDeep(consBlock, stateVarName);
+        const altTrans = s.alternate ? extractTransitionsDeep(altBlock, stateVarName) : { kind: 'none' };
+        // Both arms must resolve to *some* recognisable transition (even
+        // 'none' is fine — it just means that arm falls through with no
+        // explicit jump) for this to be worth structuring as if/else.
+        return { kind: 'branch', test: s.test, consequent: consTrans, alternate: altTrans, consBlock, altBlock };
+      }
+    }
+    return extractTransition(stmts, stateVarName);
+  }
+
   // ── Helper: strip control-transfer + state assignments from statement list ────
   function stripTransfer(stmts, stateVarName) {
     return stmts.filter(s => {
       if (t.isBreakStatement(s) || t.isContinueStatement(s)) return false;
+      // A ReturnStatement is itself a transition leaf (handled separately by
+      // extractTransition/extractTransitionsDeep + re-emitted by the caller
+      // as a fresh `return` node) — keeping it here as well would duplicate
+      // it in the output.
+      if (t.isReturnStatement(s)) return false;
       if (t.isExpressionStatement(s) && t.isAssignmentExpression(s.expression)) {
         const { left, operator } = s.expression;
         if (operator === '=' && t.isIdentifier(left) && left.name === stateVarName) return false;
@@ -989,209 +1048,167 @@ async function bootstrap() {
       if (key === null) continue;
       const allStmts = swCase.consequent.filter(s => !t.isBreakStatement(s) && !t.isContinueStatement(s));
       const node = new CfgNode(key, allStmts);
+      // Store the full transition TREE (may be a 'branch' node) rather than
+      // only the trailing transition — this is what allows if/else recovery
+      // for cases whose body ends in a conditional jump to two different
+      // states instead of a single unconditional one.
+      node.trans = extractTransitionsDeep(allStmts, stateVarName);
       nodes.set(key, node);
       order.push(key);
     }
 
-    // Wire up successor edges, including conditional branches (if/else state assignments)
-    for (const [key, node] of nodes) {
-      const trans = extractTransition(node.stmts, stateVarName);
-      if (trans.kind === 'assign') {
-        node.succs.push({ cond: null, target: trans.value });
-      } else if (trans.kind === 'return') {
-        node.succs.push({ cond: null, target: '__return__', returnArg: trans.value });
-      } else if (trans.kind === 'break') {
-        node.succs.push({ cond: null, target: '__break__' });
-      } else if (trans.kind === 'continue') {
-        node.succs.push({ cond: null, target: '__continue__' });
-      }
-      // Also detect if-based conditional transitions inside the body
-      const cond = detectConditionalTransition(node.stmts, stateVarName);
-      if (cond) {
-        node.succs.push({ cond: cond.test, target: cond.trueState });
-        node.succs.push({ cond: { __neg: true, test: cond.test }, target: cond.falseState });
-      }
+    // Wire up successor edges (used only for reachability / back-edge
+    // detection — the actual statements are re-derived from node.trans
+    // during emission so branch arms aren't lost).
+    function collectTargets(trans, out) {
+      if (!trans) return;
+      if (trans.kind === 'assign') out.push(trans.value);
+      else if (trans.kind === 'return') out.push('__return__');
+      else if (trans.kind === 'branch') { collectTargets(trans.consequent, out); collectTargets(trans.alternate, out); }
+    }
+    for (const [, node] of nodes) {
+      const targets = [];
+      collectTargets(node.trans, targets);
+      for (const tgt of targets) node.succs.push({ cond: null, target: tgt });
     }
 
     return { nodes, order, initialState };
   }
 
-  // ── Helper: is a statement list a simple "if/else" branch? ─────────────────
-  // Detects: if (cond) { stateVar = A; } else { stateVar = B; }
-  // Returns { test, trueState, falseState } or null
-  function detectConditionalTransition(stmts, stateVarName) {
-    for (const s of stmts) {
-      if (!t.isIfStatement(s)) continue;
-      const cons = s.consequent;
-      const alt  = s.alternate;
-      if (!cons || !alt) continue;
-      function extractStateAssign(node) {
-        const body = t.isBlockStatement(node) ? node.body : [node];
-        for (const st of body) {
-          if (t.isExpressionStatement(st) && t.isAssignmentExpression(st.expression)) {
-            const { left, right, operator } = st.expression;
-            if (operator === '=' && t.isIdentifier(left) && left.name === stateVarName) {
-              if (t.isNumericLiteral(right)) return right.value;
-              if (t.isStringLiteral(right)) return right.value;
-            }
-          }
-          if (t.isBreakStatement(st)) return '__break__';
-          if (t.isContinueStatement(st)) return '__continue__';
-        }
-        return null;
-      }
-      const trueState  = extractStateAssign(cons);
-      const falseState = extractStateAssign(alt);
-      if (trueState !== null && falseState !== null) {
-        return { test: s.test, trueState, falseState };
-      }
-    }
-    return null;
-  }
-
-  // ── Helper: check if two CFG node ids form a loop (back-edge exists) ─────
-  function findBackEdges(nodes, initialState) {
-    const backEdges = new Set();
-    const visited = new Set();
-    const inStack = new Set();
-    function dfs(key) {
-      if (!nodes.has(key) || visited.has(key)) return;
-      visited.add(key);
-      inStack.add(key);
-      const node = nodes.get(key);
-      for (const { target } of node.succs) {
-        if (!target || target === '__return__' || target === '__break__' || target === '__continue__') continue;
-        if (inStack.has(target)) { backEdges.add(target + '->' + key); continue; }
-        dfs(target);
-      }
-      inStack.delete(key);
-    }
-    dfs(initialState);
-    return backEdges;
-  }
-
-  // ── Helper: check if a set of stmts contains only a state assignment ───────
-  function isOnlyStateAssign(stmts, stateVarName) {
-    const real = stmts.filter(s => {
-      if (t.isBreakStatement(s) || t.isContinueStatement(s)) return false;
-      if (t.isExpressionStatement(s) && t.isAssignmentExpression(s.expression)) {
-        const { left, operator } = s.expression;
-        if (operator === '=' && t.isIdentifier(left) && left.name === stateVarName) return false;
-      }
-      return true;
-    });
-    return real.length === 0;
-  }
-
-  // ── Emit structured statements from a CFG (with if/else/loop recovery) ─────
+  // ── Emit structured statements from a CFG (if/else + loop recovery) ──────────
+  //
+  // This is a small Relooper-style structurer:
+  //
+  //   emitFrom(key, activePath)
+  //     - activePath is the stack of node keys whose emission is currently
+  //       "in progress" (an ancestor chain, innermost last). If `key`
+  //       reappears in activePath, that's a genuine back-edge: the state
+  //       machine jumps back to a node whose body we are still in the
+  //       middle of emitting, i.e. a loop. We emit a `continue` right here
+  //       at the detection site (this is the exact point in the nested
+  //       if/else tree where the jump-back happens) and tag the result with
+  //       `backEdge: key` so it bubbles up unchanged through every
+  //       intermediate frame (assign-chains and branch arms alike) until it
+  //       reaches the one frame whose own key equals `backEdge` — that
+  //       frame, and only that frame, wraps its emitted body in
+  //       `while (true) { ... }`. The old code's `visited` Set just
+  //       silently dropped the jump and the statements behind it, which is
+  //       a correctness bug — those statements really do execute again on
+  //       every loop iteration in the original program.
   function cfgToStatements(cfg, stateVarName) {
     const { nodes, order, initialState } = cfg;
-    const visited = new Set();
-    const result = [];
+    const MAX_NODES_PER_RUN = 4096; // guard against pathological/cyclic metadata
+    let emitBudget = MAX_NODES_PER_RUN;
+    // Tracks every node key that has ever been emitted by ANY emitFrom call
+    // (whether at the top level or nested inside a branch/loop). This is
+    // distinct from `activePath` (which only tracks the current ancestor
+    // chain for back-edge detection) — without this set, the final
+    // "unreachable nodes" sweep below would re-emit nodes that are already
+    // nested inside an if/else or while body from an earlier top-level
+    // entry point, duplicating their statements in the output.
+    const globallyEmitted = new Set();
 
-    // Detect back-edges to identify potential loop heads
-    const backEdges = findBackEdges(nodes, initialState);
-    const loopHeads = new Set();
-    for (const edge of backEdges) {
-      const [, head] = edge.split('->');
-      if (head) loopHeads.add(head);
+    // Render the literal (non-transition) statements of a node's body.
+    function nodeBodyStmts(node) {
+      // node.trans may be a 'branch' — in that case the trailing IfStatement
+      // itself is the transition and must NOT be included verbatim (we
+      // rebuild it from the branch tree instead). For non-branch nodes the
+      // transition is a single trailing statement already excluded by
+      // stripTransfer.
+      if (node.trans.kind === 'branch') {
+        // Every statement except the trailing IfStatement.
+        return stripTransfer(node.stmts.slice(0, -1), stateVarName);
+      }
+      return stripTransfer(node.stmts, stateVarName);
     }
 
-    function emit(key, depth = 0) {
-      if (key === null || key === undefined) return;
-      if (key === '__return__' || key === '__break__' || key === '__continue__') return;
-      if (visited.has(key) || depth > 64) return;
-      visited.add(key);
+    // Resolve a transition (leaf or branch) into { stmts, backEdge }.
+    // backEdge is null, or the key of the ancestor node (somewhere in the
+    // current activePath) that some arm jumped back to — this value is
+    // produced exactly once, at the leaf detection site inside emitFrom,
+    // and simply forwarded unchanged through every intermediate assign/
+    // branch frame above it. A `continue` statement is already present in
+    // `stmts` at the correct nested position by the time backEdge is set;
+    // intermediate frames never need to (and must not) inject their own.
+    function emitTransition(trans, activePath) {
+      if (--emitBudget < 0) return { stmts: [], backEdge: null };
+      switch (trans.kind) {
+        case 'return':
+          return { stmts: [t.returnStatement(trans.value ?? null)], backEdge: null };
+        case 'break':
+        case 'continue':
+        case 'none':
+          return { stmts: [], backEdge: null };
+        case 'assign':
+          return emitFrom(trans.value, activePath);
+        case 'branch': {
+          const consSub = emitTransition(trans.consequent, activePath);
+          const altSub = trans.alternate ? emitTransition(trans.alternate, activePath) : { stmts: [], backEdge: null };
+          const consLeading = stripTransfer(trans.consBlock, stateVarName);
+          const altLeading = trans.altBlock ? stripTransfer(trans.altBlock, stateVarName) : [];
+          const consBody = [...consLeading, ...consSub.stmts];
+          const altBody = [...altLeading, ...altSub.stmts];
+          const ifStmt = t.ifStatement(
+            trans.test,
+            t.blockStatement(consBody),
+            altBody.length > 0 ? t.blockStatement(altBody) : null
+          );
+          // At most one arm of a well-formed loop condition normally loops
+          // back; if (in pathological input) both did, prefer the
+          // consequent's target — the other is still structurally valid,
+          // just nested one level deeper than a minimal structuring would
+          // place it, which doesn't affect correctness.
+          const backEdge = consSub.backEdge ?? altSub.backEdge ?? null;
+          return { stmts: [ifStmt], backEdge };
+        }
+        default:
+          return { stmts: [], backEdge: null };
+      }
+    }
 
+    // Emit a node and everything reachable from it in sequence, given the
+    // activePath of ancestor keys currently mid-emission.
+    function emitFrom(key, activePath) {
+      if (--emitBudget < 0) return { stmts: [], backEdge: null };
+      if (key === null || key === undefined || key === '__return__') return { stmts: [], backEdge: null };
+      if (activePath.includes(key)) {
+        // Genuine back-edge, detected at the exact point of the jump: emit
+        // `continue` right here (it will end up correctly nested inside
+        // whichever if/else arm caused the jump, since this return value
+        // flows straight up through emitTransition's branch case above)
+        // and tag it so the ancestor frame for `key` knows to wrap itself.
+        return { stmts: [t.continueStatement()], backEdge: key };
+      }
       const node = nodes.get(key);
-      if (!node) return;
+      if (!node) return { stmts: [], backEdge: null };
+      globallyEmitted.add(key);
 
-      const trans = extractTransition(node.stmts, stateVarName);
-      const bodyStmts = stripTransfer(node.stmts, stateVarName);
+      const bodyStmts = nodeBodyStmts(node);
+      const transResult = emitTransition(node.trans, [...activePath, key]);
+      const combinedStmts = [...bodyStmts, ...transResult.stmts];
 
-      // Detect conditional branching (if/else)
-      const condTrans = detectConditionalTransition(node.stmts, stateVarName);
-
-      if (condTrans) {
-        // Emit body statements before the if-branch
-        const preStmts = stripTransfer(bodyStmts.filter(s => !t.isIfStatement(s)), stateVarName);
-        result.push(...preStmts);
-
-        const { test, trueState, falseState } = condTrans;
-        // Build then/else blocks by recursively collecting their statements
-        const thenStmts = [];
-        const elseStmts = [];
-
-        function collectBranch(targetKey, target) {
-          if (targetKey === '__break__') { target.push(t.breakStatement()); return; }
-          if (targetKey === '__continue__') { target.push(t.continueStatement()); return; }
-          if (targetKey === '__return__') return;
-          if (!nodes.has(targetKey)) return;
-          const bn = nodes.get(targetKey);
-          if (!visited.has(targetKey)) {
-            visited.add(targetKey);
-            const bTrans = extractTransition(bn.stmts, stateVarName);
-            const bBody = stripTransfer(bn.stmts, stateVarName);
-            target.push(...bBody);
-            if (bTrans.kind === 'return') target.push(t.returnStatement(bTrans.returnArg ?? null));
-            else if (bTrans.kind === 'assign') emit(bTrans.value, depth + 1);
-          }
-        }
-
-        // Check if both branches converge to the same node (simple if/else)
-        const trueNode  = nodes.get(trueState);
-        const falseNode = nodes.get(falseState);
-
-        if (trueNode && !visited.has(trueState)) {
-          visited.add(trueState);
-          const bTrans = extractTransition(trueNode.stmts, stateVarName);
-          thenStmts.push(...stripTransfer(trueNode.stmts, stateVarName));
-          if (bTrans.kind === 'return') thenStmts.push(t.returnStatement(bTrans.returnArg ?? null));
-        }
-        if (falseNode && !visited.has(falseState)) {
-          visited.add(falseState);
-          const bTrans = extractTransition(falseNode.stmts, stateVarName);
-          elseStmts.push(...stripTransfer(falseNode.stmts, stateVarName));
-          if (bTrans.kind === 'return') elseStmts.push(t.returnStatement(bTrans.returnArg ?? null));
-        }
-
-        const thenBlock = t.blockStatement(thenStmts);
-        const elseBlock = elseStmts.length > 0 ? t.blockStatement(elseStmts) : null;
-        result.push(t.ifStatement(test, thenBlock, elseBlock));
-
-        // Continue with the state after both branches if they converge
-        const trueNext  = trueNode  ? extractTransition(trueNode.stmts, stateVarName) : { kind: 'none' };
-        const falseNext = falseNode ? extractTransition(falseNode.stmts, stateVarName) : { kind: 'none' };
-        if (trueNext.kind === 'assign' && falseNext.kind === 'assign' && trueNext.value === falseNext.value)
-          emit(trueNext.value, depth + 1);
-        return;
+      if (transResult.backEdge === key) {
+        // This frame is the loop header the back-edge targeted: wrap the
+        // fully-assembled body (which already contains a correctly-nested
+        // `continue` at the jump site) in `while (true) { ... }`.
+        const whileNode = t.whileStatement(t.booleanLiteral(true), t.blockStatement(combinedStmts));
+        return { stmts: [whileNode], backEdge: null };
       }
-
-      // Detect while loop: node transitions to itself (self-loop) or back to a loop head
-      const isLoopHead = loopHeads.has(key);
-      if (isLoopHead && trans.kind === 'assign' && trans.value === key) {
-        // while (true) { ...body... } — self-referencing state
-        result.push(...bodyStmts);
-        return;
-      }
-
-      // Emit body statements
-      result.push(...bodyStmts);
-
-      if (trans.kind === 'return') {
-        result.push(t.returnStatement(trans.returnArg ?? null));
-      } else if (trans.kind === 'assign') {
-        emit(trans.value, depth + 1);
-      } else if (trans.kind === 'break') {
-        result.push(t.breakStatement());
-      } else if (trans.kind === 'continue') {
-        result.push(t.continueStatement());
-      }
+      // Either no back-edge occurred, or it targets an ancestor further up
+      // activePath — either way, just forward it unchanged.
+      return { stmts: combinedStmts, backEdge: transResult.backEdge };
     }
 
-    emit(initialState);
-    // Emit any unreachable nodes (may have side-effects or be error handlers)
-    for (const key of order) emit(key);
+    const result = [];
+    function runFrom(key) {
+      if (key === null || key === undefined || key === '__return__' || globallyEmitted.has(key)) return;
+      const { stmts } = emitFrom(key, []);
+      result.push(...stmts);
+    }
+
+    runFrom(initialState);
+    // Emit any unreachable nodes too (they may still matter for fallthrough logic).
+    for (const key of order) runFrom(key);
 
     return result;
   }
@@ -2012,14 +2029,20 @@ async function bootstrap() {
   };
 
   // ── Fixed-Point Optimization Engine ────────────────────────────────────────
-  // Hashes the generated code after every full sweep and stops only when the
-  // hash is identical to the previous iteration (true fixed point).
-  // Includes ALL algebraic, structural, and control-flow passes so that
-  // each newly-simplified node can unlock further simplifications.
-  // Structural rename passes are excluded to avoid unbounded churn.
+  // Hashes the serialized AST after every full sweep and stops only when the
+  // hash is identical to the previous iteration (true fixed point).  A maximum
+  // iteration cap prevents pathological loops.
+  //
+  // ALL purely-algebraic / non-structural passes are included so that each
+  // newly-simplified constant can unlock further simplifications discovered
+  // in the same round (e.g. string decoding → concat folding → dead branch).
+  //
+  // Structural passes (control-flow, rename, …) run in the outer pipeline and
+  // are NOT repeated here to avoid unbounded rename churn.
 
   function astHash(ast) {
-    // Fast FNV-1a over the concise code string
+    // Fast FNV-1a over the concise code string – far cheaper than JSON.stringify
+    // of the full AST and still detects any node-level change.
     let code = '';
     try { code = generate(ast, { concise: true, jsescOption: { minimal: true } }).code; } catch(_) { code = String(Date.now()); }
     let h = 0x811c9dc5 >>> 0;
@@ -2027,100 +2050,77 @@ async function bootstrap() {
     return h.toString(36);
   }
 
-  // Run a single pass silently, return true if the AST changed
-  async function runPassOnce(pass, ast, signal) {
-    const h0 = astHash(ast);
-    try {
-      const ctx = { log: () => {}, signal, traverse, types: t };
-      if (pass.run.constructor.name === 'AsyncFunction') await pass.run(ast, ctx);
-      else pass.run(ast, ctx);
-    } catch(_) {}
-    return astHash(ast) !== h0;
-  }
-
   const iterativeFixedPointPass = {
     id: 'iterativeFixedPoint',
-    name: 'Iterative Fixed-Point (full convergence)',
+    name: 'Iterative Fixed-Point (hash-gated convergence)',
     priority: 95,
     enabled: true,
     async run(ast, { log, signal }) {
-      // Full ordered pipeline: string decoding → algebraic folding → structural →
-      // control flow → dead code. Every category is re-run whenever any earlier
-      // category produced a change, so a single newly-resolved constant can cascade
-      // through all subsequent passes in the same iteration.
+      // Ordered list of passes to cycle.  Priorities within the cycle are
+      // deliberately from lowest (earlier) to highest (later) so that each
+      // algebraic simplification immediately feeds the next.
       const cyclePasses = [
-        // ── Tier 1: string & encoding resolution ────────────────────────────
-        advancedStringDecoderPass,      // Base64/RC4/ROT/Caesar
-        xorDecodingPass,                // XOR array/split-map-join patterns
-        stringDecoderPass,              // String.fromCharCode, shift, nibble, join
-        zeroxDecoderPass,               // _0x obfuscator string arrays
-        stringArrayCleanupPass,         // Massive string arrays
-        runtimePatternPass,             // eval/Function inlining
-        // ── Tier 2: algebraic folding ────────────────────────────────────────
-        hexDeobfuscationPass,           // 0x / 0o / 0b → decimal
-        unicodeNormalizationPass,       // \u escape normalization
-        templateLiteralPass,            // `${x}` collapse
-        opaquePredicatePass,            // !0, !1, void 0, literal comparisons
-        bitwiseSimplifyPass,            // &, |, ^, <<, >>, >>>
-        numericLiteralPass,             // constant arithmetic
-        constantPropagationPass,        // const x = 1; use of x → 1
-        symbolicExecutionPass,          // deterministic sub-expression eval
-        // ── Tier 3: structural micro-simplifications ─────────────────────────
-        propertyAccessNormPass,         // obj["key"] → obj.key
-        objectAliasPass,                // obj.fn → originalFn
-        commaSplitterPass,              // (a, b, c) → separate stmts
-        ternaryUnfoldPass,              // deep ternaries → if/else
-        functionInlinerPass,            // single-return wrapper inlining
-        astSimplificationPass,          // cond/logical/sequence cleanup
-        // ── Tier 4: control-flow recovery ────────────────────────────────────
-        controlFlowPass,                // while(true){switch…} recovery
-        switchDispatcherPass,           // residual dispatcher patterns
-        rotateSimplificationPass,       // push/shift rotation IIFEs
-        // ── Tier 5: dead code elimination ────────────────────────────────────
-        junkStatementPass,              // void 0, standalone literals
-        deadCodePass,                   // if(false), after return, etc.
-        deadAssignmentPass,             // unread assignments
-        unusedBindingsPass,             // bindings with 0 references
-        antiDebuggerPass,               // debugger statements
-        antiDebuggerEnhancedPass,       // timing traps, devtools size checks
+        // String resolution must come first so later folds can see literals
+        advancedStringDecoderPass,
+        xorDecodingPass,
+        stringDecoderPass,
+        // Algebraic folding
+        opaquePredicatePass,
+        symbolicExecutionPass,
+        constantPropagationPass,
+        bitwiseSimplifyPass,
+        numericLiteralPass,
+        templateLiteralPass,
+        // Structural micro-simplifications
+        propertyAccessNormPass,
+        objectAliasPass,
+        commaSplitterPass,
+        // Control-flow recovery — runs inside the cycle (not just once) because
+        // folding above can turn an opaque/dynamic switch-state expression into
+        // a literal, which in turn can expose a previously-hidden dispatcher
+        // loop or an if/else branch whose test just became foldable; likewise,
+        // recovering structured control flow here can reveal new dead branches
+        // or constant expressions for the folding passes above to pick up on
+        // the *next* iteration. Order matters: controlFlowPass first (handles
+        // the common case cheaply), switchDispatcherPass mops up anything that
+        // only became a forever-loop after this iteration's folding.
+        controlFlowPass,
+        switchDispatcherPass,
+        // Function-level recovery
+        functionInlinerPass,
+        // Dead code / junk (benefits from folding + control-flow results above)
+        junkStatementPass,
+        deadCodePass,
+        deadAssignmentPass,
+        unusedBindingsPass,
+        astSimplificationPass,
       ];
 
       const MAX_ITER = 20;
-      let iteration = 0;
       let prevHash = '';
+      let iteration = 0;
       const perPassCounts = new Map(cyclePasses.map(p => [p.id, 0]));
 
-      // Inner micro-loop: run all passes in order; repeat tier if something changed
-      async function runOneTier(passes, maxInner) {
-        let tierChanged = false;
-        let inner = 0;
-        let anyChanged = true;
-        while (anyChanged && inner++ < maxInner) {
-          if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
-          anyChanged = false;
-          for (const pass of passes) {
-            if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
-            const changed = await runPassOnce(pass, ast, signal);
-            if (changed) {
-              perPassCounts.set(pass.id, (perPassCounts.get(pass.id) ?? 0) + 1);
-              anyChanged = true;
-              tierChanged = true;
-            }
-          }
-        }
-        return tierChanged;
-      }
-
-      // Outer fixed-point loop: hash the entire AST; only stop when nothing changes
       while (iteration < MAX_ITER) {
         if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+
         const hashBefore = astHash(ast);
-        if (hashBefore === prevHash) break;   // true fixed point
+        if (hashBefore === prevHash) break;   // converged
         prevHash = hashBefore;
         iteration++;
 
-        // Run all tiers together; inner micro-loops handle intra-tier cascades
-        await runOneTier(cyclePasses, 8);
+        for (const pass of cyclePasses) {
+          if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+          const h0 = astHash(ast);
+          try {
+            const silentLog = () => {};
+            const ctx = { log: silentLog, signal, traverse, types: t };
+            if (pass.run.constructor.name === 'AsyncFunction') await pass.run(ast, ctx);
+            else pass.run(ast, ctx);
+          } catch(_) { /* individual pass errors must not abort the cycle */ }
+          const h1 = astHash(ast);
+          if (h0 !== h1) perPassCounts.set(pass.id, (perPassCounts.get(pass.id) ?? 0) + 1);
+        }
       }
 
       const hashAfter = astHash(ast);
@@ -2128,7 +2128,7 @@ async function bootstrap() {
       const activePasses = [...perPassCounts.entries()].filter(([,c]) => c > 0).map(([id,c]) => id + '×' + c).join(', ');
       log(
         'Fixed-point ' + (converged ? 'converged' : 'capped') + ' after ' + iteration + ' iteration(s)' +
-        (activePasses ? ' [' + activePasses + ']' : ' [no changes]')
+        (activePasses ? ' [' + activePasses + ']' : '')
       );
     },
   };
@@ -2590,26 +2590,97 @@ async function bootstrap() {
         if (!symUnresolved(val)) env.set(node.left.name, val);
         return val;
       }
+      // Function expressions/declarations evaluate to a closure record that
+      // captures the *defining* environment (not the call-site environment).
+      // This is what makes recursive calls with constant inputs resolvable:
+      // the closure's own name is bound inside its captured scope so a
+      // self-call inside the body can look itself up via `env.get(name)`.
+      case 'FunctionExpression':
+      case 'ArrowFunctionExpression': {
+        if (node.generator || node.async) return SYM_SENTINEL;
+        // Arrow functions with expression bodies are normalized to a single
+        // implicit-return block at call time inside symCallFn.
+        const closure = {
+          __symFn: true,
+          params: node.params,
+          body: node.body,
+          isExpr: node.type === 'ArrowFunctionExpression' && !t.isBlockStatement(node.body),
+          closureEnv: env,
+          name: t.isFunctionExpression(node) && node.id ? node.id.name : null,
+        };
+        // Named function expressions can recurse via their own local name.
+        if (closure.name) {
+          const selfEnv = env.child();
+          selfEnv.set(closure.name, closure);
+          closure.closureEnv = selfEnv;
+        }
+        return closure;
+      }
       default:
         return SYM_SENTINEL;
     }
   }
 
-  // Execute a known user-defined function symbolically
+  // Execute a known user-defined function symbolically.
+  // Crucially, the closure is invoked against an environment chained off of
+  // its *captured* (definition-site) scope — callerEnv is only used to
+  // resolve the already-evaluated argument values, never as the parent scope
+  // of the callee's locals. This keeps recursive calls correct: each
+  // invocation sees the function's own name + its defining scope, not
+  // whatever happened to be in scope at an arbitrary call site.
   function symCallFn(fnDef, args, callerEnv, depth, visited) {
-    const { params, body } = fnDef;
+    const { params, body, isExpr } = fnDef;
     if (!body || depth > SYM_RECUR_LIMIT) return SYM_SENTINEL;
-    const localEnv = callerEnv.child();
+    const localEnv = (fnDef.closureEnv ?? callerEnv).child();
     for (let i = 0; i < params.length; i++) {
-      if (t.isIdentifier(params[i])) localEnv.set(params[i].name, args[i] ?? undefined);
+      const p = params[i];
+      if (t.isIdentifier(p)) {
+        localEnv.set(p.name, args[i] ?? undefined);
+      } else if (t.isAssignmentPattern(p) && t.isIdentifier(p.left)) {
+        // Default parameter: use provided arg unless it's undefined.
+        const provided = args[i];
+        if (provided === undefined) {
+          const dflt = symEval(p.right, localEnv, depth, visited);
+          localEnv.set(p.left.name, symUnresolved(dflt) ? undefined : dflt);
+        } else {
+          localEnv.set(p.left.name, provided);
+        }
+      } else {
+        // Destructuring / rest params are not supported symbolically.
+        return SYM_SENTINEL;
+      }
     }
+    if (isExpr) {
+      // Arrow function with an implicit-return expression body.
+      return symEval(body, localEnv, depth, visited);
+    }
+    // symExecBlock already unwraps the internal {__symReturn,value} marker
+    // and returns the raw value directly (or `undefined` if the function
+    // body never hit a return statement) — do not unwrap it a second time.
     return symExecBlock(body, localEnv, depth, visited);
   }
 
   // Execute a block of statements, return value of first ReturnStatement
   function symExecBlock(block, env, depth, visited) {
     if (!t.isBlockStatement(block) || depth > SYM_RECUR_LIMIT) return SYM_SENTINEL;
+    // Hoist function declarations first (real JS semantics: a FunctionDeclaration
+    // is visible to every statement in its enclosing block, including ones that
+    // textually precede it — this is what allows mutual recursion between two
+    // sibling helper functions to resolve).
     for (const stmt of block.body) {
+      if (stmt.type !== 'FunctionDeclaration' || !stmt.id) continue;
+      const closure = {
+        __symFn: true,
+        params: stmt.params,
+        body: stmt.body,
+        isExpr: false,
+        closureEnv: env,
+        name: stmt.id.name,
+      };
+      env.set(stmt.id.name, closure);
+    }
+    for (const stmt of block.body) {
+      if (stmt.type === 'FunctionDeclaration') continue; // already hoisted above
       const r = symExecStmt(stmt, env, depth, visited);
       if (r !== SYM_SENTINEL && r !== null && typeof r === 'object' && r.__symReturn) return r.value;
       // Side-effecting stmts (var decl, expr stmt) mutate env; we continue
@@ -2674,7 +2745,11 @@ async function bootstrap() {
     }
   }
 
-  // Build a SymEnv pre-seeded with all const literals visible in the program
+  // Build a SymEnv pre-seeded with all const literals and named function
+  // declarations visible in the program. Function declarations are required
+  // here (not just inside symExecBlock's per-block hoisting) because the
+  // *call site* doing the folding is often a sibling statement at module
+  // scope, sharing this same top-level env, rather than a nested block.
   function buildTopLevelEnv(ast) {
     const env = new SymEnv();
     traverse(ast, {
@@ -2683,8 +2758,27 @@ async function bootstrap() {
         const v = symEval(path2.node.init, env);
         if (!symUnresolved(v)) env.set(path2.node.id.name, v);
       },
+      FunctionDeclaration(path2) {
+        if (!path2.node.id || path2.node.generator || path2.node.async) return;
+        // Only hoist declarations whose enclosing scope is the Program itself
+        // (top-level function statements) — deeply nested closures over
+        // mutable outer variables aren't safe to treat as globally pure here
+        // and are instead handled locally by symExecBlock's per-block hoisting
+        // at call time. This also avoids name collisions between two
+        // same-named helper functions declared in unrelated nested scopes.
+        if (!path2.parentPath.isProgram()) return;
+        env.set(path2.node.id.name, {
+          __symFn: true,
+          params: path2.node.params,
+          body: path2.node.body,
+          isExpr: false,
+          closureEnv: env,
+          name: path2.node.id.name,
+        });
+      },
     });
     // Second pass: pick up consts whose initialisers reference earlier consts
+    // or reference one of the function declarations just registered above.
     traverse(ast, {
       VariableDeclarator(path2) {
         if (path2.parent.kind !== 'const' || !t.isIdentifier(path2.node.id) || !path2.node.init) return;
@@ -2731,7 +2825,9 @@ async function bootstrap() {
             // Skip MemberExpression that's the callee of a call
             if (t.isMemberExpression(path2.node) && t.isCallExpression(path2.parent) && path2.parent.callee === path2.node) return;
 
-            // Build a local env from the current scope's bindings (only literals)
+            // Build a local env from the current scope's bindings (only literals
+            // and named function declarations — both are safe to treat as
+            // constant for the lifetime of a single fold attempt).
             const localEnv = topEnv.child();
             try {
               const bindings = path2.scope?.bindings ?? {};
@@ -2739,6 +2835,14 @@ async function bootstrap() {
                 if (SYM_BLOCKED.has(name)) continue;
                 const bp = binding.path;
                 if (!bp) continue;
+                if (bp.isFunctionDeclaration()) {
+                  const fn = bp.node;
+                  if (!fn.generator && !fn.async) {
+                    const closure = { __symFn: true, params: fn.params, body: fn.body, isExpr: false, closureEnv: localEnv, name: fn.id?.name ?? name };
+                    localEnv.set(name, closure);
+                  }
+                  continue;
+                }
                 const init = bp.isVariableDeclarator() ? bp.node.init : null;
                 if (!init) continue;
                 const v2 = symEval(init, localEnv, 0, { n: 0 });
@@ -2776,7 +2880,7 @@ async function bootstrap() {
     bitwiseSimplifyPass, numericLiteralPass, propertyAccessNormPass,
     objectAliasPass, controlFlowPass, switchDispatcherPass,
     rotateSimplificationPass, commaSplitterPass, ternaryUnfoldPass,
-    opaquePredicatePass, junkStatementPass, deadAssignmentPass,
+    opaquePredicatePass, symbolicExecutionPass, junkStatementPass, deadAssignmentPass,
     deadCodePass, unusedBindingsPass, functionInlinerPass,
     astSimplificationPass, antiDebuggerPass, antiDebuggerEnhancedPass,
     scopeRenamePass, semanticRenamePass, iterativeFixedPointPass,
