@@ -2179,14 +2179,19 @@ async function bootstrap() {
       // Ordered list of passes to cycle.  Priorities within the cycle are
       // deliberately from lowest (earlier) to highest (later) so that each
       // algebraic simplification immediately feeds the next.
+      // Heavy passes (symbolicExecution, functionInliner) are intentionally
+      // excluded from the cycle — they rebuild per-node environments or do
+      // per-call-site traversals on every invocation, making them O(N²) or
+      // worse when repeated. They run once in the outer pipeline instead.
+      // The cycle contains only the cheap algebraic/structural passes that
+      // genuinely benefit from iteration (each fold can unlock the next).
       const cyclePasses = [
-        // String resolution must come first so later folds can see literals
+        // String resolution — literals unlocked here feed all folds below
         advancedStringDecoderPass,
         xorDecodingPass,
         stringDecoderPass,
-        // Algebraic folding
+        // Cheap algebraic folding (O(N) per pass)
         opaquePredicatePass,
-        symbolicExecutionPass,
         constantPropagationPass,
         bitwiseSimplifyPass,
         numericLiteralPass,
@@ -2195,20 +2200,11 @@ async function bootstrap() {
         propertyAccessNormPass,
         objectAliasPass,
         commaSplitterPass,
-        // Control-flow recovery — runs inside the cycle (not just once) because
-        // folding above can turn an opaque/dynamic switch-state expression into
-        // a literal, which in turn can expose a previously-hidden dispatcher
-        // loop or an if/else branch whose test just became foldable; likewise,
-        // recovering structured control flow here can reveal new dead branches
-        // or constant expressions for the folding passes above to pick up on
-        // the *next* iteration. Order matters: controlFlowPass first (handles
-        // the common case cheaply), switchDispatcherPass mops up anything that
-        // only became a forever-loop after this iteration's folding.
+        // Control-flow (only re-run when folding produced new literals that
+        // could resolve a switch discriminant or branch condition)
         controlFlowPass,
         switchDispatcherPass,
-        // Function-level recovery
-        functionInlinerPass,
-        // Dead code / junk (benefits from folding + control-flow results above)
+        // Dead code / junk
         junkStatementPass,
         deadCodePass,
         deadAssignmentPass,
@@ -2216,7 +2212,7 @@ async function bootstrap() {
         astSimplificationPass,
       ];
 
-      const MAX_ITER = 20;
+      const MAX_ITER = 8; // cheap passes converge quickly; 20 was for heavy passes that are no longer in the cycle
       let iteration = 0;
       const perPassCounts = new Map(cyclePasses.map(p => [p.id, 0]));
 
