@@ -2231,7 +2231,15 @@ async function bootstrap() {
           if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
           let passChanged = false;
           const countingLog = (msg) => {
-            if (msg && !String(msg).startsWith('No ')) passChanged = true;
+            if (!msg) return;
+            const s = String(msg);
+            // A pass signals no change when it logs 'No ...' OR when the first
+            // number in its message is 0 (e.g. 'Inlined 0 calls', 'Decoded 0 ...').
+            // Both patterns mean nothing was mutated this invocation.
+            if (s.startsWith('No ')) return;
+            const m = s.match(/\d+/);
+            if (m && m[0] === '0') return;
+            passChanged = true;
           };
           try {
             const ctx = { log: countingLog, signal, traverse, types: t };
