@@ -590,36 +590,58 @@ async function bootstrap() {
         identRenameMap.set(original, candidate);
       }
 
-      // Single Babel traverse: mutate StringLiteral nodes in-place (no replaceWith,
-      // no new node allocation, no path bookkeeping), and collect identifier renames.
+      // Single iterative walk: collect string normalizations + identifier renames,
+      // then apply both. No Babel traverse at all — no Path objects, no scope
+      // crawl, no per-node wrapper allocation. Iterative (explicit stack) instead
+      // of recursive to avoid stack overflow on deeply-minified ASTs.
       const strNormCache = new Map();
+      const SKIP = new Set(['type','start','end','loc','range','extra',
+        'tokens','errors','comments','leadingComments','trailingComments','innerComments']);
+
+      // Pass 1: collect — walk every node, classify, queue mutations
+      const strMutations = []; // [node, newValue]
+      const stack = [ast];
+      while (stack.length > 0) {
+        const node = stack.pop();
+        if (!node || typeof node !== 'object') continue;
+        if (Array.isArray(node)) {
+          for (let i = node.length - 1; i >= 0; i--) { if (node[i] && typeof node[i] === 'object') stack.push(node[i]); }
+          continue;
+        }
+        const nt = node.type;
+        if (nt === 'StringLiteral') {
+          const v = node.value;
+          if (hasNonAscii(v)) {
+            let n = strNormCache.get(v);
+            if (n === undefined) { n = normalizeStr(v); strNormCache.set(v, n); }
+            if (n !== v) strMutations.push([node, n]);
+          }
+        } else if (nt === 'Identifier') {
+          const name = node.name;
+          if (!ASCII_IDENT_RE.test(name) && !identRenameMap.has(name)) assignCleanName(name);
+        }
+        for (const key in node) {
+          if (SKIP.has(key)) continue;
+          const child = node[key];
+          if (child && typeof child === 'object') stack.push(child);
+        }
+      }
+
+      // Pass 2: apply string mutations
       let strNormalized = 0;
+      for (const [node, n] of strMutations) { node.value = n; if (node.extra) node.extra = undefined; strNormalized++; }
 
-      traverse(ast, {
-        StringLiteral(path2) {
-          const v = path2.node.value;
-          if (!hasNonAscii(v)) return;
-          let n = strNormCache.get(v);
-          if (n === undefined) { n = normalizeStr(v); strNormCache.set(v, n); }
-          if (n !== v) { path2.node.value = n; if (path2.node.extra) path2.node.extra = undefined; strNormalized++; }
-        },
-        Identifier(path2) {
-          const name = path2.node.name;
-          if (ASCII_IDENT_RE.test(name)) return; // already clean, fast exit
-          if (!identRenameMap.has(name)) assignCleanName(name);
-        },
-      });
-
-      // Fast recursive node walk for identifier renaming — bypasses Babel's traverse
-      // entirely (no path objects, no scope crawl, no hooks). Pure object recursion:
-      // check .type, look up map, patch .name. 5-10x faster than a second traverse()
-      // for pure node-mutation work that needs no structural AST changes.
+      // Pass 3: apply identifier renames (second iterative walk)
       let identNormalized = 0;
       if (identRenameMap.size > 0) {
-        const SKIP = new Set(['tokens', 'errors', 'comments', 'leadingComments', 'trailingComments', 'innerComments']);
-        function walkNode(node) {
-          if (!node || typeof node !== 'object') return;
-          if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) walkNode(node[i]); return; }
+        const stack2 = [ast];
+        while (stack2.length > 0) {
+          const node = stack2.pop();
+          if (!node || typeof node !== 'object') continue;
+          if (Array.isArray(node)) {
+            for (let i = node.length - 1; i >= 0; i--) { if (node[i] && typeof node[i] === 'object') stack2.push(node[i]); }
+            continue;
+          }
           if (node.type === 'Identifier') {
             const clean = identRenameMap.get(node.name);
             if (clean) { node.name = clean; identNormalized++; }
@@ -627,10 +649,9 @@ async function bootstrap() {
           for (const key in node) {
             if (SKIP.has(key)) continue;
             const child = node[key];
-            if (child && typeof child === 'object') walkNode(child);
+            if (child && typeof child === 'object') stack2.push(child);
           }
         }
-        walkNode(ast);
       }
 
       const total = strNormalized + identNormalized;
@@ -2188,66 +2209,101 @@ async function bootstrap() {
   };
 
   // ── Unicode Script Normalization (extended) ─────────────────────────────────
+  // EXTENDED_MAP is hoisted so it's built once at bootstrap, not per run() call.
+  const EXTENDED_MAP = {
+    '\uFF21':'A','\uFF22':'B','\uFF23':'C','\uFF24':'D','\uFF25':'E','\uFF26':'F','\uFF27':'G','\uFF28':'H','\uFF29':'I','\uFF2A':'J','\uFF2B':'K','\uFF2C':'L','\uFF2D':'M','\uFF2E':'N','\uFF2F':'O','\uFF30':'P','\uFF31':'Q','\uFF32':'R','\uFF33':'S','\uFF34':'T','\uFF35':'U','\uFF36':'V','\uFF37':'W','\uFF38':'X','\uFF39':'Y','\uFF3A':'Z',
+    '\uFF41':'a','\uFF42':'b','\uFF43':'c','\uFF44':'d','\uFF45':'e','\uFF46':'f','\uFF47':'g','\uFF48':'h','\uFF49':'i','\uFF4A':'j','\uFF4B':'k','\uFF4C':'l','\uFF4D':'m','\uFF4E':'n','\uFF4F':'o','\uFF50':'p','\uFF51':'q','\uFF52':'r','\uFF53':'s','\uFF54':'t','\uFF55':'u','\uFF56':'v','\uFF57':'w','\uFF58':'x','\uFF59':'y','\uFF5A':'z',
+    '\u{1D400}':'A','\u{1D401}':'B','\u{1D402}':'C','\u{1D403}':'D','\u{1D404}':'E',
+    '\u{1D41A}':'a','\u{1D41B}':'b','\u{1D41C}':'c','\u{1D41D}':'d','\u{1D41E}':'e',
+    '\u02B0':'h','\u02B2':'j','\u02B3':'r','\u02B7':'w','\u02B8':'y',
+    '\u03E2':'S','\u03E3':'s','\u03E4':'F','\u03E5':'f',
+    '\u0531':'A','\u0532':'B','\u0535':'E','\u053F':'K',
+    '\u0456':'i','\u0406':'I','\u0439':'u','\u0446':'c',
+    ...HOMOGLYPH_MAP,
+  };
+  const extNormCache = new Map(); // persists across runs within a session
+  function extNormalize(name) {
+    if (ASCII_IDENT_RE.test(name)) return name; // fast exit — already clean
+    let cached = extNormCache.get(name);
+    if (cached !== undefined) return cached;
+    let r = name.normalize('NFKD').replace(/[\u0300-\u036F\u1DC0-\u1DFF\u20D0-\u20FF]/g, '');
+    let out = '';
+    for (const ch of r) out += EXTENDED_MAP[ch] ?? ch;
+    out = out.replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD\uFE00-\uFE0F]/g, '');
+    out = out.replace(/[^\x00-\x7F]/g, '_');
+    extNormCache.set(name, out);
+    return out;
+  }
+
   const extendedUnicodeNormPass = {
     id: 'extendedUnicodeNorm', name: 'Extended Unicode Script Normalization', priority: 11, enabled: true,
     run(ast, { log }) {
-      let count = 0;
-      // Extended homoglyph map: Coptic, Armenian, Syriac, Thaana, Mathematical alphabets, Fullwidth
-      // Combined with the base HOMOGLYPH_MAP so extNormalize never calls normalizeStr() per character.
-      const EXTENDED_MAP = {
-        // Fullwidth Latin
-        '\uFF21':'A','\uFF22':'B','\uFF23':'C','\uFF24':'D','\uFF25':'E','\uFF26':'F','\uFF27':'G','\uFF28':'H','\uFF29':'I','\uFF2A':'J','\uFF2B':'K','\uFF2C':'L','\uFF2D':'M','\uFF2E':'N','\uFF2F':'O','\uFF30':'P','\uFF31':'Q','\uFF32':'R','\uFF33':'S','\uFF34':'T','\uFF35':'U','\uFF36':'V','\uFF37':'W','\uFF38':'X','\uFF39':'Y','\uFF3A':'Z',
-        '\uFF41':'a','\uFF42':'b','\uFF43':'c','\uFF44':'d','\uFF45':'e','\uFF46':'f','\uFF47':'g','\uFF48':'h','\uFF49':'i','\uFF4A':'j','\uFF4B':'k','\uFF4C':'l','\uFF4D':'m','\uFF4E':'n','\uFF4F':'o','\uFF50':'p','\uFF51':'q','\uFF52':'r','\uFF53':'s','\uFF54':'t','\uFF55':'u','\uFF56':'v','\uFF57':'w','\uFF58':'x','\uFF59':'y','\uFF5A':'z',
-        // Mathematical bold/italic/script (sample range)
-        '\u{1D400}':'A','\u{1D401}':'B','\u{1D402}':'C','\u{1D403}':'D','\u{1D404}':'E',
-        '\u{1D41A}':'a','\u{1D41B}':'b','\u{1D41C}':'c','\u{1D41D}':'d','\u{1D41E}':'e',
-        // Modifier letters
-        '\u02B0':'h','\u02B2':'j','\u02B3':'r','\u02B7':'w','\u02B8':'y',
-        // Coptic (common homoglyphs)
-        '\u03E2':'S','\u03E3':'s','\u03E4':'F','\u03E5':'f',
-        // Armenian (selected)
-        '\u0531':'A','\u0532':'B','\u0535':'E','\u053F':'K',
-        // Cyrillic (augment existing map)
-        '\u0456':'i','\u0406':'I','\u0439':'u','\u0446':'c',
-        // Base Cyrillic + Greek from HOMOGLYPH_MAP (merged here so we never call normalizeStr per char)
-        ...HOMOGLYPH_MAP,
-      };
-      // Fast ASCII check reused from needsNormalization — avoids regex allocation
-      const NON_ASCII = /[^\x00-\x7F]/;
-      // Cache normalized results per unique identifier name. In a minified file the
-      // same obfuscated name can appear thousands of times; compute the result once.
-      const identNormCache = new Map();
-      function extNormalize(name) {
-        // Fast path: already pure ASCII
-        if (!NON_ASCII.test(name)) return name;
-        let cached = identNormCache.get(name);
-        if (cached !== undefined) return cached;
-        // NFKD decompose + strip combining diacritics in one pass
-        let r = name.normalize('NFKD').replace(/[\u0300-\u036F\u1DC0-\u1DFF\u20D0-\u20FF]/g, '');
-        // Map each character through the combined table; unknown non-ASCII → keep as-is for now
-        let out = '';
-        for (const ch of r) out += EXTENDED_MAP[ch] ?? ch;
-        // Strip invisible/zero-width characters
-        out = out.replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD\uFE00-\uFE0F]/g, '');
-        // Replace any remaining non-ASCII that couldn't be mapped
-        out = out.replace(/[^\x00-\x7F]/g, '_');
-        identNormCache.set(name, out);
-        return out;
+      // Same pattern as homoglyphCleanupPass:
+      // Pass 1 — iterative stack walk, collect rename map (no scope.rename, no Babel traverse)
+      // Pass 2 — second iterative stack walk, apply renames by direct node mutation
+      // Both passes are O(n) with no stack-overflow risk on deep ASTs.
+      const renameMap = new Map(); // obfuscated name -> clean name
+      const taken = new Set();
+      const SKIP = new Set(['type','start','end','loc','range','extra',
+        'tokens','errors','comments','leadingComments','trailingComments','innerComments']);
+
+      // Pass 1: collect unique non-ASCII identifier names and compute clean targets
+      const stack = [ast];
+      while (stack.length > 0) {
+        const node = stack.pop();
+        if (!node || typeof node !== 'object') continue;
+        if (Array.isArray(node)) {
+          for (let i = node.length - 1; i >= 0; i--) { if (node[i] && typeof node[i] === 'object') stack.push(node[i]); }
+          continue;
+        }
+        if (node.type === 'Identifier' && !renameMap.has(node.name)) {
+          const name = node.name;
+          if (!ASCII_IDENT_RE.test(name)) {
+            const normalized = extNormalize(name);
+            if (normalized && normalized !== name && ASCII_IDENT_RE.test(normalized)) {
+              // Deduplicate: if two different obfuscated names normalize to the same
+              // clean name, suffix the second one to avoid a collision.
+              let candidate = normalized;
+              if (taken.has(candidate)) {
+                let n = 1;
+                do { candidate = normalized + '_' + n++; } while (taken.has(candidate));
+              }
+              taken.add(candidate);
+              renameMap.set(name, candidate);
+            }
+          }
+        }
+        for (const key in node) {
+          if (SKIP.has(key)) continue;
+          const child = node[key];
+          if (child && typeof child === 'object') stack.push(child);
+        }
       }
-      traverse(ast, {
-        Identifier(path2) {
-          const name = path2.node.name;
-          if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name)) return; // already ASCII-safe
-          const normalized = extNormalize(name);
-          if (normalized === name || !normalized || !/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(normalized)) return;
-          try {
-            const binding = path2.scope?.getBinding(name);
-            if (binding) { path2.scope.rename(name, normalized); count++; }
-            else { path2.node.name = normalized; count++; }
-          } catch(_) {}
-        },
-      });
-      if (count > 0) log('Extended unicode normalization: renamed ' + count + ' identifier(s)');
+
+      // Pass 2: apply renames by direct node mutation
+      let count = 0;
+      if (renameMap.size > 0) {
+        const stack2 = [ast];
+        while (stack2.length > 0) {
+          const node = stack2.pop();
+          if (!node || typeof node !== 'object') continue;
+          if (Array.isArray(node)) {
+            for (let i = node.length - 1; i >= 0; i--) { if (node[i] && typeof node[i] === 'object') stack2.push(node[i]); }
+            continue;
+          }
+          if (node.type === 'Identifier') {
+            const clean = renameMap.get(node.name);
+            if (clean) { node.name = clean; count++; }
+          }
+          for (const key in node) {
+            if (SKIP.has(key)) continue;
+            const child = node[key];
+            if (child && typeof child === 'object') stack2.push(child);
+          }
+        }
+      }
+
+      if (count > 0) log('Extended unicode normalization: renamed ' + count + ' identifier occurrence(s) (' + renameMap.size + ' unique name(s))');
       else log('No extended unicode identifiers found');
     },
   };
