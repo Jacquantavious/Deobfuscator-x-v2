@@ -370,56 +370,34 @@ async function bootstrap() {
           try { const str = String.fromCharCode(...codes); if (isPrintable(str)) { path2.replaceWith(t.stringLiteral(str)); decoded++; } } catch(_) {}
         },
       });
-      // Combined detector pass: shift-decoder and nibble-decoder detection are
-      // independent reads over the same function bodies — merging them into
-      // one FunctionDeclaration/VariableDeclarator visitor instead of two
-      // separate full-AST walks doesn't change what gets detected, since
-      // neither detector mutates anything a sibling detector could observe.
-      // Note: nibbleDecoders, exactly as in the original implementation, is
-      // only ever populated from FunctionDeclaration — VariableDeclarator-
-      // assigned function expressions were never checked for nibble-decoder
-      // shape, and that scope is preserved here rather than widened.
       const shiftDecoders = new Map();
-      const nibbleDecoders = new Map();
       traverse(ast, {
-        FunctionDeclaration(path2) {
-          const name = path2.node.id?.name;
-          const shiftInfo = detectShiftDecoder(path2.node);
-          if (shiftInfo) { shiftDecoders.set(name, shiftInfo); }
-          else if (detectNibbleDecoder(path2.node)) { nibbleDecoders.set(name, 'nibble'); }
-        },
-        VariableDeclarator(path2) {
-          if (!path2.node.init || !t.isIdentifier(path2.node.id)) return;
-          const shiftInfo = detectShiftDecoder(path2.node.init);
-          if (shiftInfo) shiftDecoders.set(path2.node.id.name, shiftInfo);
-        },
+        FunctionDeclaration(path2) { const i = detectShiftDecoder(path2.node); if (i) shiftDecoders.set(path2.node.id?.name, i); },
+        VariableDeclarator(path2) { if (!path2.node.init) return; const i = detectShiftDecoder(path2.node.init); if (i && t.isIdentifier(path2.node.id)) shiftDecoders.set(path2.node.id.name, i); },
       });
-      // Combined consumer pass: a given callee name was classified as at most
-      // one decoder kind above, so checking both maps in a single
-      // CallExpression visitor is equivalent to two separate traversals.
-      if (shiftDecoders.size > 0 || nibbleDecoders.size > 0) {
+      if (shiftDecoders.size > 0) {
         traverse(ast, {
           CallExpression(path2) {
             if (!t.isIdentifier(path2.node.callee)) return;
-            const name = path2.node.callee.name;
-            const args = path2.node.arguments;
-            const shiftInfo = shiftDecoders.get(name);
-            if (shiftInfo) {
-              if (args.length !== 1) return;
-              const arg = args[0];
-              if (!t.isNumericLiteral(arg)) return;
-              const r = shiftInfo.decode(arg.value);
-              if (r !== null && isPrintable(r)) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
-              return;
-            }
-            if (nibbleDecoders.has(name)) {
-              if (args.length !== 1) return;
-              const arg = args[0];
-              if (!t.isStringLiteral(arg)) return;
-              const r = unpackHexString(arg.value);
-              if (r !== null && isPrintable(r)) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
-              return;
-            }
+            const info = shiftDecoders.get(path2.node.callee.name);
+            if (!info || path2.node.arguments.length !== 1) return;
+            const arg = path2.node.arguments[0];
+            if (!t.isNumericLiteral(arg)) return;
+            const r = info.decode(arg.value);
+            if (r !== null && isPrintable(r)) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
+          },
+        });
+      }
+      const nibbleDecoders = new Map();
+      traverse(ast, { FunctionDeclaration(path2) { if (detectNibbleDecoder(path2.node)) nibbleDecoders.set(path2.node.id?.name, 'nibble'); } });
+      if (nibbleDecoders.size > 0) {
+        traverse(ast, {
+          CallExpression(path2) {
+            if (!t.isIdentifier(path2.node.callee) || !nibbleDecoders.has(path2.node.callee.name) || path2.node.arguments.length !== 1) return;
+            const arg = path2.node.arguments[0];
+            if (!t.isStringLiteral(arg)) return;
+            const r = unpackHexString(arg.value);
+            if (r !== null && isPrintable(r)) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
           },
         });
       }
@@ -505,17 +483,8 @@ async function bootstrap() {
     id: 'xorDecoding', name: 'XOR Decoding', priority: 8, enabled: true,
     run(ast, { log }) {
       let decoded = 0;
-      // These two checks match mutually-exclusive AST shapes (arr.map().join('')
-      // with an inline XOR vs str.split().map().join('')), and neither's result
-      // depends on the other having already run — safe to combine into one
-      // CallExpression visitor instead of two separate full-AST walks.
       traverse(ast, {
         CallExpression(path2) {
-          if (isSplitMapJoinXor(path2.node)) {
-            const r = evalSplitMapJoinXor(path2.node);
-            if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
-            return;
-          }
           if (!t.isMemberExpression(path2.node.callee) || !t.isIdentifier(path2.node.callee.property) || path2.node.callee.property.name !== 'join') return;
           if (!path2.node.arguments[0] || !t.isStringLiteral(path2.node.arguments[0], { value: '' })) return;
           const mapCall = path2.node.callee.object;
@@ -533,6 +502,13 @@ async function bootstrap() {
             else return;
             path2.replaceWith(t.stringLiteral(result)); decoded++;
           } catch(_) {}
+        },
+      });
+      traverse(ast, {
+        CallExpression(path2) {
+          if (!isSplitMapJoinXor(path2.node)) return;
+          const r = evalSplitMapJoinXor(path2.node);
+          if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
         },
       });
       const xorFunctions = new Map();
@@ -569,14 +545,17 @@ async function bootstrap() {
     if (/[\u0300-\u036F\u1DC0-\u1DFF\u20D0-\u20FF]/.test(name)) return true;
     return false;
   }
+  // Shared homoglyph map used by normalizeStr and extendedUnicodeNormPass
+  const HOMOGLYPH_MAP = { '\u0430':'a','\u0435':'e','\u043E':'o','\u0440':'p','\u0441':'c','\u0443':'y','\u0445':'x','\u0410':'A','\u0412':'B','\u0415':'E','\u041A':'K','\u041C':'M','\u041D':'H','\u041E':'O','\u0420':'P','\u0421':'C','\u0422':'T','\u0425':'X','\u03B1':'a','\u03B2':'b','\u03B5':'e','\u03BF':'o','\u03BD':'v','\u03BA':'k','\u0391':'A','\u0392':'B','\u0395':'E','\u039A':'K','\u039C':'M','\u039D':'N','\u039F':'O','\u03A1':'P','\u03A4':'T','\u03A5':'Y','\u03A7':'X' };
   function normalizeStr(str) {
+    // Fast path: pure ASCII strings need no normalization whatsoever
+    if (!/[^\x00-\x7F]/.test(str)) return str;
     let r = str.normalize('NFKD');
     r = r.replace(/[\u0300-\u036F]/g, '');
     r = r.replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD]/g, '');
     r = r.replace(/[\uFE00-\uFE0F]/g, '');
-    const map = { '\u0430':'a','\u0435':'e','\u043E':'o','\u0440':'p','\u0441':'c','\u0443':'y','\u0445':'x','\u0410':'A','\u0412':'B','\u0415':'E','\u041A':'K','\u041C':'M','\u041D':'H','\u041E':'O','\u0420':'P','\u0421':'C','\u0422':'T','\u0425':'X','\u03B1':'a','\u03B2':'b','\u03B5':'e','\u03BF':'o','\u03BD':'v','\u03BA':'k','\u0391':'A','\u0392':'B','\u0395':'E','\u039A':'K','\u039C':'M','\u039D':'N','\u039F':'O','\u03A1':'P','\u03A4':'T','\u03A5':'Y','\u03A7':'X' };
     let out = '';
-    for (const ch of r) out += map[ch] ?? ch;
+    for (const ch of r) out += HOMOGLYPH_MAP[ch] ?? ch;
     return out;
   }
 
@@ -594,7 +573,19 @@ async function bootstrap() {
         renameMap.set(original, n);
         return n;
       }
-      traverse(ast, { StringLiteral(path2) { const n = normalizeStr(path2.node.value); if (n !== path2.node.value) path2.replaceWith(t.stringLiteral(n)); } });
+      // Cache normalizeStr results per unique string value — the same obfuscated
+      // string can appear thousands of times in a minified file; compute once.
+      const strNormCache = new Map();
+      traverse(ast, {
+        StringLiteral(path2) {
+          const v = path2.node.value;
+          // Fast path: skip strings that are already pure ASCII
+          if (!/[^\x00-\x7F]/.test(v)) return;
+          let n = strNormCache.get(v);
+          if (n === undefined) { n = normalizeStr(v); strNormCache.set(v, n); }
+          if (n !== v) path2.replaceWith(t.stringLiteral(n));
+        },
+      });
       traverse(ast, {
         FunctionDeclaration(path2) {
           const id = path2.node.id;
@@ -1686,58 +1677,69 @@ async function bootstrap() {
           if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
         },
       });
-      // Combined detector pass: base64 / ROT13 / RC4 wrapper functions are each
-      // independent (a function can only match one shape in practice), but the
-      // detection logic only *reads* function bodies — it's safe and equivalent
-      // to run all three detectors inside the same FunctionDeclaration/
-      // VariableDeclarator visitor instead of three separate full-AST walks.
+      // Detect and inline base64 wrapper functions
       const b64Fns = new Map();
-      const rotFns = new Map();
-      const rc4Fns = new Map();
-      function detectAllWrapperKinds(name, fn) {
-        if (!name || !fn) return;
-        if (detectBase64Fn(fn)) { b64Fns.set(name, true); return; }
-        const s = JSON.stringify(fn.body);
-        if (s.includes('charCodeAt') && (s.includes('13') || s.includes('ROT'))) { rotFns.set(name, 13); return; }
-        if (detectRC4Fn(fn) && fn.params.length >= 2) { rc4Fns.set(name, true); return; }
-      }
       traverse(ast, {
-        FunctionDeclaration(path2) { detectAllWrapperKinds(path2.node.id?.name, path2.node); },
+        FunctionDeclaration(path2) { if (detectBase64Fn(path2.node)) b64Fns.set(path2.node.id?.name, true); },
         VariableDeclarator(path2) {
           const init = path2.node.init;
-          if ((t.isFunctionExpression(init) || t.isArrowFunctionExpression(init)) && t.isIdentifier(path2.node.id)) {
-            detectAllWrapperKinds(path2.node.id.name, init);
-          }
+          if ((t.isFunctionExpression(init)||t.isArrowFunctionExpression(init)) && detectBase64Fn(init) && t.isIdentifier(path2.node.id)) b64Fns.set(path2.node.id.name, true);
         },
       });
-      // Combined consumer pass: each CallExpression can only match one of the
-      // three maps (a given callee name was classified as exactly one wrapper
-      // kind above), so checking all three in one CallExpression visitor is
-      // equivalent to three separate traversals, just cheaper.
-      if (b64Fns.size > 0 || rotFns.size > 0 || rc4Fns.size > 0) {
+      if (b64Fns.size > 0) {
         traverse(ast, {
           CallExpression(path2) {
-            if (!t.isIdentifier(path2.node.callee)) return;
-            const name = path2.node.callee.name;
+            if (!t.isIdentifier(path2.node.callee) || !b64Fns.has(path2.node.callee.name)) return;
             const args = path2.node.arguments;
-            if (b64Fns.has(name)) {
-              if (args.length !== 1 || !t.isStringLiteral(args[0])) return;
-              const r = tryBase64(args[0].value);
-              if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
-              return;
-            }
-            if (rotFns.has(name)) {
-              if (args.length !== 1 || !t.isStringLiteral(args[0])) return;
-              const r = tryROT13(args[0].value);
-              if (isPrintable(r)) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
-              return;
-            }
-            if (rc4Fns.has(name)) {
-              if (args.length < 2 || !t.isStringLiteral(args[0]) || !t.isStringLiteral(args[1])) return;
-              const r = simpleRC4(args[0].value, args[1].value) ?? simpleRC4(args[1].value, args[0].value);
-              if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
-              return;
-            }
+            if (args.length !== 1 || !t.isStringLiteral(args[0])) return;
+            const r = tryBase64(args[0].value);
+            if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
+          },
+        });
+      }
+      // ROT13 wrapper detection: function that calls .replace with /[A-Za-z]/g and charCode arithmetic
+      const rotFns = new Map();
+      traverse(ast, {
+        FunctionDeclaration(path2) {
+          const s = JSON.stringify(path2.node.body);
+          if (s.includes('charCodeAt') && (s.includes('13') || s.includes('ROT'))) rotFns.set(path2.node.id?.name, 13);
+        },
+        VariableDeclarator(path2) {
+          const init = path2.node.init;
+          if (!t.isFunctionExpression(init) && !t.isArrowFunctionExpression(init)) return;
+          const s = JSON.stringify(init.body);
+          if (s.includes('charCodeAt') && (s.includes('13') || s.includes('ROT')) && t.isIdentifier(path2.node.id)) rotFns.set(path2.node.id.name, 13);
+        },
+      });
+      if (rotFns.size > 0) {
+        traverse(ast, {
+          CallExpression(path2) {
+            if (!t.isIdentifier(path2.node.callee) || !rotFns.has(path2.node.callee.name)) return;
+            const args = path2.node.arguments;
+            if (args.length !== 1 || !t.isStringLiteral(args[0])) return;
+            const r = tryROT13(args[0].value);
+            if (isPrintable(r)) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
+          },
+        });
+      }
+      // RC4 wrapper detection
+      const rc4Fns = new Map();
+      traverse(ast, {
+        FunctionDeclaration(path2) { if (detectRC4Fn(path2.node) && path2.node.params.length >= 2) rc4Fns.set(path2.node.id?.name, true); },
+        VariableDeclarator(path2) {
+          const init = path2.node.init;
+          if (!t.isFunctionExpression(init) && !t.isArrowFunctionExpression(init)) return;
+          if (detectRC4Fn(init) && init.params.length >= 2 && t.isIdentifier(path2.node.id)) rc4Fns.set(path2.node.id.name, true);
+        },
+      });
+      if (rc4Fns.size > 0) {
+        traverse(ast, {
+          CallExpression(path2) {
+            if (!t.isIdentifier(path2.node.callee) || !rc4Fns.has(path2.node.callee.name)) return;
+            const args = path2.node.arguments;
+            if (args.length < 2 || !t.isStringLiteral(args[0]) || !t.isStringLiteral(args[1])) return;
+            const r = simpleRC4(args[0].value, args[1].value) ?? simpleRC4(args[1].value, args[0].value);
+            if (r !== null) { path2.replaceWith(t.stringLiteral(r)); decoded++; }
           },
         });
       }
@@ -2053,51 +2055,13 @@ async function bootstrap() {
   // Structural passes (control-flow, rename, …) run in the outer pipeline and
   // are NOT repeated here to avoid unbounded rename churn.
 
-  // Fields present on every Babel node that never affect program semantics —
-  // skipping them means a pass that only updates source positions (or that
-  // re-parses and gets fresh loc/start/end values for otherwise-identical
-  // code) doesn't spuriously register as "changed".
-  const HASH_SKIP_KEYS = new Set(['loc', 'start', 'end', 'range', 'leadingComments', 'trailingComments', 'innerComments', 'extra', '_paths', 'tokens']);
-
   function astHash(ast) {
-    // Structural FNV-1a over the AST object graph directly — no Babel
-    // generate() call (no Printer, no string-builder, no source-map
-    // position tracking) and no traverse() call (no NodePath wrapping, no
-    // Scope/Binding bookkeeping). Both of those are real work that a pure
-    // change-detector has no need to pay for. This walk only touches each
-    // node's `type` tag plus its own scalar fields (and recurses into child
-    // nodes/arrays), which is everything that can affect program meaning.
-    //
-    // Deliberately generic (a plain `for...in` over each node) rather than a
-    // switch keyed on known node types: a hand-written per-type switch is
-    // faster still, but silently contributes nothing to the hash for any
-    // node type the switch doesn't enumerate — which would make the
-    // fixed-point loop think it converged while a real, unhashed change
-    // still exists somewhere in the tree. Generic-but-correct is the right
-    // tradeoff for a convergence gate.
+    // Fast FNV-1a over the concise code string – far cheaper than JSON.stringify
+    // of the full AST and still detects any node-level change.
+    let code = '';
+    try { code = generate(ast, { concise: true, jsescOption: { minimal: true } }).code; } catch(_) { code = String(Date.now()); }
     let h = 0x811c9dc5 >>> 0;
-    const mix = (str) => {
-      for (let i = 0; i < str.length; i++) { h = (h ^ str.charCodeAt(i)) >>> 0; h = Math.imul(h, 0x01000193) >>> 0; }
-    };
-    const walk = (node) => {
-      if (node === null || node === undefined) { mix('\u0000'); return; }
-      if (Array.isArray(node)) {
-        h = (h ^ (node.length + 1)) >>> 0;
-        for (let i = 0; i < node.length; i++) walk(node[i]);
-        return;
-      }
-      if (typeof node !== 'object') { mix(typeof node === 'string' ? node : String(node)); return; }
-      if (typeof node.type !== 'string') return; // not an AST node (e.g. a stray plain object) — no signal to mix
-      mix(node.type);
-      for (const k in node) {
-        if (HASH_SKIP_KEYS.has(k) || k === 'type') continue;
-        const v = node[k];
-        if (v === null || v === undefined) continue;
-        if (typeof v === 'object') walk(v);
-        else mix(k + ':' + (typeof v === 'string' ? v : String(v)));
-      }
-    };
-    try { walk(ast); } catch(_) { return String(Date.now()); }
+    for (let i = 0; i < code.length; i++) { h ^= code.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
     return h.toString(36);
   }
 
@@ -2148,44 +2112,37 @@ async function bootstrap() {
       ];
 
       const MAX_ITER = 20;
+      let prevHash = '';
       let iteration = 0;
       const perPassCounts = new Map(cyclePasses.map(p => [p.id, 0]));
 
-      // `currentHash` always reflects the AST's structural hash as of the end
-      // of the most recently completed pass (or, before the loop starts, the
-      // AST's initial state). Each pass call only needs ONE fresh hash
-      // afterward — the "before" value for the pass-level diff is just
-      // whatever `currentHash` already holds from the previous step, so it's
-      // never recomputed redundantly.
-      let currentHash = astHash(ast);
-
       while (iteration < MAX_ITER) {
         if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+
+        const hashBefore = astHash(ast);
+        if (hashBefore === prevHash) break;   // converged
+        prevHash = hashBefore;
         iteration++;
-        let iterChanged = false;
 
         for (const pass of cyclePasses) {
           if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
-          const before = currentHash;
+          const h0 = astHash(ast);
           try {
             const silentLog = () => {};
             const ctx = { log: silentLog, signal, traverse, types: t };
             if (pass.run.constructor.name === 'AsyncFunction') await pass.run(ast, ctx);
             else pass.run(ast, ctx);
           } catch(_) { /* individual pass errors must not abort the cycle */ }
-          currentHash = astHash(ast);
-          if (before !== currentHash) {
-            perPassCounts.set(pass.id, (perPassCounts.get(pass.id) ?? 0) + 1);
-            iterChanged = true;
-          }
+          const h1 = astHash(ast);
+          if (h0 !== h1) perPassCounts.set(pass.id, (perPassCounts.get(pass.id) ?? 0) + 1);
         }
-
-        if (!iterChanged) break; // no pass in this iteration changed anything -> converged
       }
 
+      const hashAfter = astHash(ast);
+      const converged = hashAfter === prevHash;
       const activePasses = [...perPassCounts.entries()].filter(([,c]) => c > 0).map(([id,c]) => id + '×' + c).join(', ');
       log(
-        'Fixed-point ' + (iteration < MAX_ITER ? 'converged' : 'capped') + ' after ' + iteration + ' iteration(s)' +
+        'Fixed-point ' + (converged ? 'converged' : 'capped') + ' after ' + iteration + ' iteration(s)' +
         (activePasses ? ' [' + activePasses + ']' : '')
       );
     },
@@ -2197,6 +2154,7 @@ async function bootstrap() {
     run(ast, { log }) {
       let count = 0;
       // Extended homoglyph map: Coptic, Armenian, Syriac, Thaana, Mathematical alphabets, Fullwidth
+      // Combined with the base HOMOGLYPH_MAP so extNormalize never calls normalizeStr() per character.
       const EXTENDED_MAP = {
         // Fullwidth Latin
         '\uFF21':'A','\uFF22':'B','\uFF23':'C','\uFF24':'D','\uFF25':'E','\uFF26':'F','\uFF27':'G','\uFF28':'H','\uFF29':'I','\uFF2A':'J','\uFF2B':'K','\uFF2C':'L','\uFF2D':'M','\uFF2E':'N','\uFF2F':'O','\uFF30':'P','\uFF31':'Q','\uFF32':'R','\uFF33':'S','\uFF34':'T','\uFF35':'U','\uFF36':'V','\uFF37':'W','\uFF38':'X','\uFF39':'Y','\uFF3A':'Z',
@@ -2212,15 +2170,29 @@ async function bootstrap() {
         '\u0531':'A','\u0532':'B','\u0535':'E','\u053F':'K',
         // Cyrillic (augment existing map)
         '\u0456':'i','\u0406':'I','\u0439':'u','\u0446':'c',
+        // Base Cyrillic + Greek from HOMOGLYPH_MAP (merged here so we never call normalizeStr per char)
+        ...HOMOGLYPH_MAP,
       };
+      // Fast ASCII check reused from needsNormalization — avoids regex allocation
+      const NON_ASCII = /[^\x00-\x7F]/;
+      // Cache normalized results per unique identifier name. In a minified file the
+      // same obfuscated name can appear thousands of times; compute the result once.
+      const identNormCache = new Map();
       function extNormalize(name) {
+        // Fast path: already pure ASCII
+        if (!NON_ASCII.test(name)) return name;
+        let cached = identNormCache.get(name);
+        if (cached !== undefined) return cached;
+        // NFKD decompose + strip combining diacritics in one pass
         let r = name.normalize('NFKD').replace(/[\u0300-\u036F\u1DC0-\u1DFF\u20D0-\u20FF]/g, '');
+        // Map each character through the combined table; unknown non-ASCII → keep as-is for now
         let out = '';
-        for (const ch of r) out += EXTENDED_MAP[ch] ?? normalizeStr(ch);
-        // Remove zero-width and invisible chars
+        for (const ch of r) out += EXTENDED_MAP[ch] ?? ch;
+        // Strip invisible/zero-width characters
         out = out.replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\uFFFD\uFE00-\uFE0F]/g, '');
-        // Strip non-ASCII that couldn't be mapped
+        // Replace any remaining non-ASCII that couldn't be mapped
         out = out.replace(/[^\x00-\x7F]/g, '_');
+        identNormCache.set(name, out);
         return out;
       }
       traverse(ast, {
@@ -2870,45 +2842,6 @@ async function bootstrap() {
     run(ast, { log }) {
       let folded = 0;
       const topEnv = buildTopLevelEnv(ast);
-      // Every expression node within the same lexical scope would otherwise
-      // rebuild an identical localEnv (same bindings, same symEval calls on
-      // the same initializers) from scratch — on a file with many
-      // expressions packed into a few scopes (the common case for both
-      // normal and obfuscated code), that's a large multiplicative cost for
-      // zero additional benefit, since the bindings visible to a scope don't
-      // change mid-traversal just because we're looking at a different
-      // expression inside it. Babel guarantees `path.scope` is the same
-      // object reference for every path within the same lexical scope during
-      // a single traversal, so caching by that reference is safe.
-      const scopeEnvCache = new Map();
-      function getLocalEnv(scope) {
-        if (!scope) return topEnv.child();
-        const cached = scopeEnvCache.get(scope);
-        if (cached) return cached;
-        const localEnv = topEnv.child();
-        try {
-          const bindings = scope.bindings ?? {};
-          for (const [name, binding] of Object.entries(bindings)) {
-            if (SYM_BLOCKED.has(name)) continue;
-            const bp = binding.path;
-            if (!bp) continue;
-            if (bp.isFunctionDeclaration()) {
-              const fn = bp.node;
-              if (!fn.generator && !fn.async) {
-                const closure = { __symFn: true, params: fn.params, body: fn.body, isExpr: false, closureEnv: localEnv, name: fn.id?.name ?? name };
-                localEnv.set(name, closure);
-              }
-              continue;
-            }
-            const init = bp.isVariableDeclarator() ? bp.node.init : null;
-            if (!init) continue;
-            const v2 = symEval(init, localEnv, 0, { n: 0 });
-            if (!symUnresolved(v2)) localEnv.set(name, v2);
-          }
-        } catch(_) {}
-        scopeEnvCache.set(scope, localEnv);
-        return localEnv;
-      }
 
       traverse(ast, {
         // Only replace expression nodes that are NOT already literals
@@ -2922,7 +2855,30 @@ async function bootstrap() {
             // Skip MemberExpression that's the callee of a call
             if (t.isMemberExpression(path2.node) && t.isCallExpression(path2.parent) && path2.parent.callee === path2.node) return;
 
-            const localEnv = getLocalEnv(path2.scope);
+            // Build a local env from the current scope's bindings (only literals
+            // and named function declarations — both are safe to treat as
+            // constant for the lifetime of a single fold attempt).
+            const localEnv = topEnv.child();
+            try {
+              const bindings = path2.scope?.bindings ?? {};
+              for (const [name, binding] of Object.entries(bindings)) {
+                if (SYM_BLOCKED.has(name)) continue;
+                const bp = binding.path;
+                if (!bp) continue;
+                if (bp.isFunctionDeclaration()) {
+                  const fn = bp.node;
+                  if (!fn.generator && !fn.async) {
+                    const closure = { __symFn: true, params: fn.params, body: fn.body, isExpr: false, closureEnv: localEnv, name: fn.id?.name ?? name };
+                    localEnv.set(name, closure);
+                  }
+                  continue;
+                }
+                const init = bp.isVariableDeclarator() ? bp.node.init : null;
+                if (!init) continue;
+                const v2 = symEval(init, localEnv, 0, { n: 0 });
+                if (!symUnresolved(v2)) localEnv.set(name, v2);
+              }
+            } catch(_) {}
 
             const val = symEval(path2.node, localEnv, 0, { n: 0 });
             if (symUnresolved(val)) return;
