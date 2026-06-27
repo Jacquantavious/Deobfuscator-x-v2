@@ -2217,40 +2217,39 @@ async function bootstrap() {
       ];
 
       const MAX_ITER = 20;
-      let prevHash = '';
       let iteration = 0;
       const perPassCounts = new Map(cyclePasses.map(p => [p.id, 0]));
 
-      while (iteration < MAX_ITER) {
-        if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+      // Convergence detection uses log-call counting instead of astHash per pass.
+      // Every pass calls log() with a count when it mutates something (e.g. "Folded
+      // 3 expressions"), or with a "No ..." / empty message when idle. Any non-idle
+      // log message signals a mutation — no hashing needed per pass.
+      let anyChangedLastIter = true;
 
-        const hashBefore = astHash(ast);
-        if (hashBefore === prevHash) break;   // converged
-        prevHash = hashBefore;
+      while (iteration < MAX_ITER && anyChangedLastIter) {
+        if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
         iteration++;
+        anyChangedLastIter = false;
 
         for (const pass of cyclePasses) {
           if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
-          // Use a cheap mutation counter instead of hashing before+after each pass.
-          // Each pass's traverse visitor calls replaceWith/remove which we can't
-          // intercept directly, so we take one hash per full inner-loop iteration
-          // (above) rather than wrapping every pass. For per-pass accounting we
-          // compare the outer hash to a snapshot taken at the start of this pass
-          // only when we need to record activity — deferred to avoid extra walks.
-          const h0 = astHash(ast);
+          let passChanged = false;
+          const countingLog = (msg) => {
+            if (msg && !String(msg).startsWith('No ')) passChanged = true;
+          };
           try {
-            const silentLog = () => {};
-            const ctx = { log: silentLog, signal, traverse, types: t };
+            const ctx = { log: countingLog, signal, traverse, types: t };
             if (pass.run.constructor.name === 'AsyncFunction') await pass.run(ast, ctx);
             else pass.run(ast, ctx);
           } catch(_) { /* individual pass errors must not abort the cycle */ }
-          const h1 = astHash(ast);
-          if (h0 !== h1) perPassCounts.set(pass.id, (perPassCounts.get(pass.id) ?? 0) + 1);
+          if (passChanged) {
+            anyChangedLastIter = true;
+            perPassCounts.set(pass.id, (perPassCounts.get(pass.id) ?? 0) + 1);
+          }
         }
       }
 
-      const hashAfter = astHash(ast);
-      const converged = hashAfter === prevHash;
+      const converged = !anyChangedLastIter;
       const activePasses = [...perPassCounts.entries()].filter(([,c]) => c > 0).map(([id,c]) => id + '×' + c).join(', ');
       log(
         'Fixed-point ' + (converged ? 'converged' : 'capped') + ' after ' + iteration + ' iteration(s)' +
