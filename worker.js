@@ -590,24 +590,48 @@ async function bootstrap() {
         identRenameMap.set(original, candidate);
       }
 
-      // Single iterative walk: collect string normalizations + identifier renames,
-      // then apply both. No Babel traverse at all — no Path objects, no scope
-      // crawl, no per-node wrapper allocation. Iterative (explicit stack) instead
-      // of recursive to avoid stack overflow on deeply-minified ASTs.
-      const strNormCache = new Map();
-      const SKIP = new Set(['type','start','end','loc','range','extra',
-        'tokens','errors','comments','leadingComments','trailingComments','innerComments']);
-
-      // Pass 1: collect — walk every node, classify, queue mutations
-      const strMutations = []; // [node, newValue]
-      const stack = [ast];
-      while (stack.length > 0) {
-        const node = stack.pop();
-        if (!node || typeof node !== 'object') continue;
-        if (Array.isArray(node)) {
-          for (let i = node.length - 1; i >= 0; i--) { if (node[i] && typeof node[i] === 'object') stack.push(node[i]); }
-          continue;
+      // iterWalk: iterative AST walk immune to Babel's circular back-references.
+      // After any traverse() call, Babel attaches path/parentPath/scope/hub/context
+      // to nodes — for...in walks these and loops infinitely. This uses:
+      //   1. A visited WeakSet to skip already-seen objects (handles cycles)
+      //   2. Object.keys() instead of for...in (own keys only, no prototype chain)
+      //   3. A prototype check to skip Babel's non-plain-object internal refs
+      function iterWalk(root, onNode) {
+        const visited = new WeakSet();
+        const stack = [root];
+        while (stack.length > 0) {
+          const node = stack.pop();
+          if (!node || typeof node !== 'object' || visited.has(node)) continue;
+          visited.add(node);
+          if (Array.isArray(node)) {
+            for (let i = 0; i < node.length; i++) {
+              const el = node[i];
+              if (el && typeof el === 'object' && !visited.has(el)) stack.push(el);
+            }
+            continue;
+          }
+          onNode(node);
+          const keys = Object.keys(node);
+          for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' ||
+                key === 'range' || key === 'extra' || key === 'tokens' || key === 'errors' ||
+                key === 'comments' || key === 'leadingComments' || key === 'trailingComments' ||
+                key === 'innerComments' || key === 'name' || key === 'value' || key === 'operator') continue;
+            const child = node[key];
+            if (!child || typeof child !== 'object') continue;
+            const ctor = Object.getPrototypeOf(child);
+            if (ctor !== Object.prototype && ctor !== Array.prototype) continue;
+            if (!visited.has(child)) stack.push(child);
+          }
         }
+      }
+
+      const strNormCache = new Map();
+      const strMutations = [];
+
+      // Pass 1: collect string mutations + identifier rename candidates
+      iterWalk(ast, node => {
         const nt = node.type;
         if (nt === 'StringLiteral') {
           const v = node.value;
@@ -620,38 +644,20 @@ async function bootstrap() {
           const name = node.name;
           if (!ASCII_IDENT_RE.test(name) && !identRenameMap.has(name)) assignCleanName(name);
         }
-        for (const key in node) {
-          if (SKIP.has(key)) continue;
-          const child = node[key];
-          if (child && typeof child === 'object') stack.push(child);
-        }
-      }
+      });
 
       // Pass 2: apply string mutations
       let strNormalized = 0;
       for (const [node, n] of strMutations) { node.value = n; if (node.extra) node.extra = undefined; strNormalized++; }
 
-      // Pass 3: apply identifier renames (second iterative walk)
+      // Pass 3: apply identifier renames
       let identNormalized = 0;
       if (identRenameMap.size > 0) {
-        const stack2 = [ast];
-        while (stack2.length > 0) {
-          const node = stack2.pop();
-          if (!node || typeof node !== 'object') continue;
-          if (Array.isArray(node)) {
-            for (let i = node.length - 1; i >= 0; i--) { if (node[i] && typeof node[i] === 'object') stack2.push(node[i]); }
-            continue;
-          }
-          if (node.type === 'Identifier') {
-            const clean = identRenameMap.get(node.name);
-            if (clean) { node.name = clean; identNormalized++; }
-          }
-          for (const key in node) {
-            if (SKIP.has(key)) continue;
-            const child = node[key];
-            if (child && typeof child === 'object') stack2.push(child);
-          }
-        }
+        iterWalk(ast, node => {
+          if (node.type !== 'Identifier') return;
+          const clean = identRenameMap.get(node.name);
+          if (clean) { node.name = clean; identNormalized++; }
+        });
       }
 
       const total = strNormalized + identNormalized;
@@ -2238,69 +2244,76 @@ async function bootstrap() {
   const extendedUnicodeNormPass = {
     id: 'extendedUnicodeNorm', name: 'Extended Unicode Script Normalization', priority: 11, enabled: true,
     run(ast, { log }) {
-      // Same pattern as homoglyphCleanupPass:
-      // Pass 1 — iterative stack walk, collect rename map (no scope.rename, no Babel traverse)
-      // Pass 2 — second iterative stack walk, apply renames by direct node mutation
-      // Both passes are O(n) with no stack-overflow risk on deep ASTs.
-      const renameMap = new Map(); // obfuscated name -> clean name
+      const renameMap = new Map();
       const taken = new Set();
-      const SKIP = new Set(['type','start','end','loc','range','extra',
-        'tokens','errors','comments','leadingComments','trailingComments','innerComments']);
 
-      // Pass 1: collect unique non-ASCII identifier names and compute clean targets
-      const stack = [ast];
-      while (stack.length > 0) {
-        const node = stack.pop();
-        if (!node || typeof node !== 'object') continue;
-        if (Array.isArray(node)) {
-          for (let i = node.length - 1; i >= 0; i--) { if (node[i] && typeof node[i] === 'object') stack.push(node[i]); }
-          continue;
-        }
-        if (node.type === 'Identifier' && !renameMap.has(node.name)) {
-          const name = node.name;
-          if (!ASCII_IDENT_RE.test(name)) {
-            const normalized = extNormalize(name);
-            if (normalized && normalized !== name && ASCII_IDENT_RE.test(normalized)) {
-              // Deduplicate: if two different obfuscated names normalize to the same
-              // clean name, suffix the second one to avoid a collision.
-              let candidate = normalized;
-              if (taken.has(candidate)) {
-                let n = 1;
-                do { candidate = normalized + '_' + n++; } while (taken.has(candidate));
-              }
-              taken.add(candidate);
-              renameMap.set(name, candidate);
+      // Babel attaches circular back-references (path, parentPath, scope, hub, context)
+      // to AST nodes after any traverse() call. for...in walks these and loops forever.
+      // Fix: use a visited WeakSet to deduplicate, and only descend into keys whose
+      // values are plain AST node objects (have a .type string) or arrays thereof.
+      // This is robust against any circular refs regardless of what prior passes added.
+      function iterWalk(root, onNode) {
+        const visited = new WeakSet();
+        const stack = [root];
+        while (stack.length > 0) {
+          const node = stack.pop();
+          if (!node || typeof node !== 'object') continue;
+          if (visited.has(node)) continue;
+          visited.add(node);
+          if (Array.isArray(node)) {
+            for (let i = 0; i < node.length; i++) {
+              const el = node[i];
+              if (el && typeof el === 'object' && !visited.has(el)) stack.push(el);
             }
+            continue;
           }
-        }
-        for (const key in node) {
-          if (SKIP.has(key)) continue;
-          const child = node[key];
-          if (child && typeof child === 'object') stack.push(child);
+          onNode(node);
+          // Only push children that look like AST nodes or arrays of them.
+          // Critically: do NOT use for...in — it walks prototype chain and Babel's
+          // circular path/scope/hub refs. Use Object.keys() (own enumerable only).
+          const keys = Object.keys(node);
+          for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            // Skip primitive-valued and known non-AST metadata fields
+            if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' ||
+                key === 'range' || key === 'extra' || key === 'tokens' || key === 'errors' ||
+                key === 'comments' || key === 'leadingComments' || key === 'trailingComments' ||
+                key === 'innerComments' || key === 'name' || key === 'value' || key === 'operator') continue;
+            const child = node[key];
+            if (!child || typeof child !== 'object') continue;
+            // Skip Babel path/scope objects: they have non-plain-object constructors
+            // and contain circular refs. AST nodes and arrays have plain constructors.
+            const ctor = Object.getPrototypeOf(child);
+            if (ctor !== Object.prototype && ctor !== Array.prototype) continue;
+            if (!visited.has(child)) stack.push(child);
+          }
         }
       }
 
-      // Pass 2: apply renames by direct node mutation
+      // Pass 1: collect rename candidates
+      iterWalk(ast, node => {
+        if (node.type !== 'Identifier') return;
+        const name = node.name;
+        if (renameMap.has(name) || ASCII_IDENT_RE.test(name)) return;
+        const normalized = extNormalize(name);
+        if (!normalized || normalized === name || !ASCII_IDENT_RE.test(normalized)) return;
+        let candidate = normalized;
+        if (taken.has(candidate)) {
+          let n = 1;
+          do { candidate = normalized + '_' + n++; } while (taken.has(candidate));
+        }
+        taken.add(candidate);
+        renameMap.set(name, candidate);
+      });
+
+      // Pass 2: apply renames
       let count = 0;
       if (renameMap.size > 0) {
-        const stack2 = [ast];
-        while (stack2.length > 0) {
-          const node = stack2.pop();
-          if (!node || typeof node !== 'object') continue;
-          if (Array.isArray(node)) {
-            for (let i = node.length - 1; i >= 0; i--) { if (node[i] && typeof node[i] === 'object') stack2.push(node[i]); }
-            continue;
-          }
-          if (node.type === 'Identifier') {
-            const clean = renameMap.get(node.name);
-            if (clean) { node.name = clean; count++; }
-          }
-          for (const key in node) {
-            if (SKIP.has(key)) continue;
-            const child = node[key];
-            if (child && typeof child === 'object') stack2.push(child);
-          }
-        }
+        iterWalk(ast, node => {
+          if (node.type !== 'Identifier') return;
+          const clean = renameMap.get(node.name);
+          if (clean) { node.name = clean; count++; }
+        });
       }
 
       if (count > 0) log('Extended unicode normalization: renamed ' + count + ' identifier occurrence(s) (' + renameMap.size + ' unique name(s))');
