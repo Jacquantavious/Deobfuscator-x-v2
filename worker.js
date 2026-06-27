@@ -559,81 +559,78 @@ async function bootstrap() {
     return out;
   }
 
+  // hasNonAscii: plain JS char-code loop — faster than regex for the short
+  // strings that make up the overwhelming majority of identifier checks.
+  function hasNonAscii(s) {
+    for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) > 0x7F) return true;
+    return false;
+  }
+  // Pre-compiled once at bootstrap; used as a fast exit for already-clean identifiers.
+  const ASCII_IDENT_RE = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/;
+
   const homoglyphCleanupPass = {
     id: 'homoglyphCleanup', name: 'Homoglyph & Unicode Identifier Cleanup', priority: 9, enabled: true,
     run(ast, { log }) {
-      // ── Phase 1: build rename map for identifiers ────────────────────────────
-      // Collect every unique non-ASCII identifier name and compute its clean form
-      // once, then rewrite all Identifier nodes in a single second traversal.
-      // This avoids calling scope.rename() in a loop — each call does a full
-      // scope crawl + re-traversal, which is O(n) per rename → catastrophic on
-      // a 84k-line minified file with many obfuscated names.
-      const identRenameMap = new Map(); // obfuscated name → clean name
+      const identRenameMap = new Map(); // obfuscated name -> clean name
+      const taken = new Set();
       const counters = {};
-      const taken = new Set(); // names already assigned, to avoid collisions
-      const NON_ASCII = /[^\x00-\x7F]/;
 
-      function assignCleanName(original, hint) {
-        if (identRenameMap.has(original)) return;
+      function assignCleanName(original) {
         const normalized = normalizeStr(original);
-        // Only rename if normalization actually changes the name and yields a valid identifier
-        if (normalized === original || !normalized) return;
-        // Build a base from the normalized result, falling back to hint
-        const raw = normalized.replace(/[^a-zA-Z0-9_$]/g, '') || hint || 'var';
-        const base = /^[0-9]/.test(raw) ? '_' + raw : raw; // can't start with digit
+        if (!normalized || normalized === original) return;
+        const raw = normalized.replace(/[^a-zA-Z0-9_$]/g, '') || 'v';
+        const base = raw.charCodeAt(0) >= 48 && raw.charCodeAt(0) <= 57 ? '_' + raw : raw;
         let candidate = base;
         if (taken.has(candidate)) {
-          counters[base] = (counters[base] || 1);
-          do { candidate = base + '_' + (counters[base]++); } while (taken.has(candidate));
+          let n = counters[base] || 1;
+          do { candidate = base + '_' + n++; } while (taken.has(candidate));
+          counters[base] = n;
         }
         taken.add(candidate);
         identRenameMap.set(original, candidate);
       }
 
-      // First pass: collect string literal rewrites and identifier rename candidates
+      // Single Babel traverse: mutate StringLiteral nodes in-place (no replaceWith,
+      // no new node allocation, no path bookkeeping), and collect identifier renames.
       const strNormCache = new Map();
-      const strReplacements = []; // collect [path, newValue] to apply after traversal
+      let strNormalized = 0;
 
       traverse(ast, {
         StringLiteral(path2) {
           const v = path2.node.value;
-          if (!NON_ASCII.test(v)) return; // pure ASCII, nothing to do
+          if (!hasNonAscii(v)) return;
           let n = strNormCache.get(v);
           if (n === undefined) { n = normalizeStr(v); strNormCache.set(v, n); }
-          if (n !== v) strReplacements.push([path2, n]);
+          if (n !== v) { path2.node.value = n; if (path2.node.extra) path2.node.extra = undefined; strNormalized++; }
         },
         Identifier(path2) {
           const name = path2.node.name;
-          if (!NON_ASCII.test(name)) return; // pure ASCII, skip
-          if (!identRenameMap.has(name)) {
-            // Determine a hint from context
-            let hint = 'var';
-            const p = path2.parent;
-            if (p && (p.type === 'FunctionDeclaration' || p.type === 'FunctionExpression') && p.id === path2.node) hint = 'func';
-            else if (p && p.type === 'ClassDeclaration' && p.id === path2.node) hint = 'cls';
-            assignCleanName(name, hint);
-          }
+          if (ASCII_IDENT_RE.test(name)) return; // already clean, fast exit
+          if (!identRenameMap.has(name)) assignCleanName(name);
         },
       });
 
-      // Apply string literal replacements (safe to do after the traversal)
-      let strNormalized = 0;
-      for (const [path2, n] of strReplacements) {
-        try { path2.replaceWith(t.stringLiteral(n)); strNormalized++; } catch(_) {}
-      }
-
-      // ── Phase 2: rewrite all Identifier nodes in one pass ───────────────────
-      // Direct node mutation is safe here because we're renaming based purely on
-      // the character content of the name — every occurrence of the same obfuscated
-      // name gets the same clean name, which preserves all references correctly.
+      // Fast recursive node walk for identifier renaming — bypasses Babel's traverse
+      // entirely (no path objects, no scope crawl, no hooks). Pure object recursion:
+      // check .type, look up map, patch .name. 5-10x faster than a second traverse()
+      // for pure node-mutation work that needs no structural AST changes.
       let identNormalized = 0;
       if (identRenameMap.size > 0) {
-        traverse(ast, {
-          Identifier(path2) {
-            const clean = identRenameMap.get(path2.node.name);
-            if (clean) { path2.node.name = clean; identNormalized++; }
-          },
-        });
+        const SKIP = new Set(['tokens', 'errors', 'comments', 'leadingComments', 'trailingComments', 'innerComments']);
+        function walkNode(node) {
+          if (!node || typeof node !== 'object') return;
+          if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) walkNode(node[i]); return; }
+          if (node.type === 'Identifier') {
+            const clean = identRenameMap.get(node.name);
+            if (clean) { node.name = clean; identNormalized++; }
+          }
+          for (const key in node) {
+            if (SKIP.has(key)) continue;
+            const child = node[key];
+            if (child && typeof child === 'object') walkNode(child);
+          }
+        }
+        walkNode(ast);
       }
 
       const total = strNormalized + identNormalized;
