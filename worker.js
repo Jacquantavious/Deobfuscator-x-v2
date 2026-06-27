@@ -562,41 +562,83 @@ async function bootstrap() {
   const homoglyphCleanupPass = {
     id: 'homoglyphCleanup', name: 'Homoglyph & Unicode Identifier Cleanup', priority: 9, enabled: true,
     run(ast, { log }) {
-      let normalized = 0;
-      const renameMap = new Map();
+      // ── Phase 1: build rename map for identifiers ────────────────────────────
+      // Collect every unique non-ASCII identifier name and compute its clean form
+      // once, then rewrite all Identifier nodes in a single second traversal.
+      // This avoids calling scope.rename() in a loop — each call does a full
+      // scope crawl + re-traversal, which is O(n) per rename → catastrophic on
+      // a 84k-line minified file with many obfuscated names.
+      const identRenameMap = new Map(); // obfuscated name → clean name
       const counters = {};
-      function getNewName(original, hint = 'var') {
-        if (renameMap.has(original)) return renameMap.get(original);
-        const base = hint.replace(/[^a-z]/g, '') || 'var';
-        counters[base] = (counters[base] || 0) + 1;
-        const n = base + '_' + counters[base];
-        renameMap.set(original, n);
-        return n;
+      const taken = new Set(); // names already assigned, to avoid collisions
+      const NON_ASCII = /[^\x00-\x7F]/;
+
+      function assignCleanName(original, hint) {
+        if (identRenameMap.has(original)) return;
+        const normalized = normalizeStr(original);
+        // Only rename if normalization actually changes the name and yields a valid identifier
+        if (normalized === original || !normalized) return;
+        // Build a base from the normalized result, falling back to hint
+        const raw = normalized.replace(/[^a-zA-Z0-9_$]/g, '') || hint || 'var';
+        const base = /^[0-9]/.test(raw) ? '_' + raw : raw; // can't start with digit
+        let candidate = base;
+        if (taken.has(candidate)) {
+          counters[base] = (counters[base] || 1);
+          do { candidate = base + '_' + (counters[base]++); } while (taken.has(candidate));
+        }
+        taken.add(candidate);
+        identRenameMap.set(original, candidate);
       }
-      // Cache normalizeStr results per unique string value — the same obfuscated
-      // string can appear thousands of times in a minified file; compute once.
+
+      // First pass: collect string literal rewrites and identifier rename candidates
       const strNormCache = new Map();
+      const strReplacements = []; // collect [path, newValue] to apply after traversal
+
       traverse(ast, {
         StringLiteral(path2) {
           const v = path2.node.value;
-          // Fast path: skip strings that are already pure ASCII
-          if (!/[^\x00-\x7F]/.test(v)) return;
+          if (!NON_ASCII.test(v)) return; // pure ASCII, nothing to do
           let n = strNormCache.get(v);
           if (n === undefined) { n = normalizeStr(v); strNormCache.set(v, n); }
-          if (n !== v) path2.replaceWith(t.stringLiteral(n));
+          if (n !== v) strReplacements.push([path2, n]);
+        },
+        Identifier(path2) {
+          const name = path2.node.name;
+          if (!NON_ASCII.test(name)) return; // pure ASCII, skip
+          if (!identRenameMap.has(name)) {
+            // Determine a hint from context
+            let hint = 'var';
+            const p = path2.parent;
+            if (p && (p.type === 'FunctionDeclaration' || p.type === 'FunctionExpression') && p.id === path2.node) hint = 'func';
+            else if (p && p.type === 'ClassDeclaration' && p.id === path2.node) hint = 'cls';
+            assignCleanName(name, hint);
+          }
         },
       });
-      traverse(ast, {
-        FunctionDeclaration(path2) {
-          const id = path2.node.id;
-          if (id && needsNormalization(id.name)) { try { path2.scope.rename(id.name, getNewName(id.name, 'func')); normalized++; } catch(_) {} }
-        },
-        VariableDeclarator(path2) {
-          const id = path2.node.id;
-          if (t.isIdentifier(id) && needsNormalization(id.name)) { try { path2.scope.rename(id.name, getNewName(id.name, 'var')); normalized++; } catch(_) {} }
-        },
-      });
-      log('Normalized ' + normalized + ' unicode identifier(s)');
+
+      // Apply string literal replacements (safe to do after the traversal)
+      let strNormalized = 0;
+      for (const [path2, n] of strReplacements) {
+        try { path2.replaceWith(t.stringLiteral(n)); strNormalized++; } catch(_) {}
+      }
+
+      // ── Phase 2: rewrite all Identifier nodes in one pass ───────────────────
+      // Direct node mutation is safe here because we're renaming based purely on
+      // the character content of the name — every occurrence of the same obfuscated
+      // name gets the same clean name, which preserves all references correctly.
+      let identNormalized = 0;
+      if (identRenameMap.size > 0) {
+        traverse(ast, {
+          Identifier(path2) {
+            const clean = identRenameMap.get(path2.node.name);
+            if (clean) { path2.node.name = clean; identNormalized++; }
+          },
+        });
+      }
+
+      const total = strNormalized + identNormalized;
+      if (total > 0) log('Normalized ' + strNormalized + ' string(s), ' + identNormalized + ' identifier occurrence(s) (' + identRenameMap.size + ' unique name(s))');
+      else log('No homoglyph/unicode identifiers found');
     },
   };
 
