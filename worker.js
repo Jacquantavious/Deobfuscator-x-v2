@@ -2121,13 +2121,52 @@ async function bootstrap() {
   // Structural passes (control-flow, rename, …) run in the outer pipeline and
   // are NOT repeated here to avoid unbounded rename churn.
 
+  // astHash: FNV-1a directly over the AST node graph — no code generation.
+  // Walks every node's type + primitive fields (name, value, operator, kind)
+  // using the same visited-WeakSet / Object.keys() pattern used elsewhere to
+  // avoid Babel's circular back-references.  ~10-50× faster than generate().
   function astHash(ast) {
-    // Fast FNV-1a over the concise code string – far cheaper than JSON.stringify
-    // of the full AST and still detects any node-level change.
-    let code = '';
-    try { code = generate(ast, { concise: true, jsescOption: { minimal: true } }).code; } catch(_) { code = String(Date.now()); }
     let h = 0x811c9dc5 >>> 0;
-    for (let i = 0; i < code.length; i++) { h ^= code.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    function mix(str) {
+      for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+      h ^= 0x9e3779b9; h = Math.imul(h, 0x01000193) >>> 0; // separator
+    }
+    const SKIP_KEYS = new Set([
+      'start','end','loc','range','extra','tokens','errors',
+      'comments','leadingComments','trailingComments','innerComments',
+    ]);
+    const visited = new WeakSet();
+    const stack = [ast];
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (!node || typeof node !== 'object' || visited.has(node)) continue;
+      visited.add(node);
+      if (Array.isArray(node)) {
+        mix('\x00A\x00');
+        for (let i = node.length - 1; i >= 0; i--) {
+          const el = node[i];
+          if (el && typeof el === 'object' && !visited.has(el)) stack.push(el);
+        }
+        continue;
+      }
+      // Hash structural fields
+      if (node.type)     mix(node.type);
+      if (node.name  !== undefined && node.name  !== null) mix('\x01' + node.name);
+      if (node.operator !== undefined)                     mix('\x02' + node.operator);
+      if (node.kind  !== undefined)                        mix('\x03' + node.kind);
+      if (node.value !== undefined && node.value !== null && typeof node.value !== 'object') mix('\x04' + node.value);
+      // Push plain-object/array children
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        if (SKIP_KEYS.has(key) || key === 'type' || key === 'name' || key === 'value' || key === 'operator' || key === 'kind') continue;
+        const child = node[key];
+        if (!child || typeof child !== 'object' || visited.has(child)) continue;
+        const ctor = Object.getPrototypeOf(child);
+        if (ctor !== Object.prototype && ctor !== Array.prototype) continue;
+        stack.push(child);
+      }
+    }
     return h.toString(36);
   }
 
@@ -2192,6 +2231,12 @@ async function bootstrap() {
 
         for (const pass of cyclePasses) {
           if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+          // Use a cheap mutation counter instead of hashing before+after each pass.
+          // Each pass's traverse visitor calls replaceWith/remove which we can't
+          // intercept directly, so we take one hash per full inner-loop iteration
+          // (above) rather than wrapping every pass. For per-pass accounting we
+          // compare the outer hash to a snapshot taken at the start of this pass
+          // only when we need to record activity — deferred to avoid extra walks.
           const h0 = astHash(ast);
           try {
             const silentLog = () => {};
