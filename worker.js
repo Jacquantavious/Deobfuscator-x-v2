@@ -2176,89 +2176,117 @@ async function bootstrap() {
     priority: 95,
     enabled: true,
     async run(ast, { log, signal }) {
-      // Ordered list of passes to cycle.  Priorities within the cycle are
-      // deliberately from lowest (earlier) to highest (later) so that each
-      // algebraic simplification immediately feeds the next.
-      // Heavy passes (symbolicExecution, functionInliner) are intentionally
-      // excluded from the cycle — they rebuild per-node environments or do
-      // per-call-site traversals on every invocation, making them O(N²) or
-      // worse when repeated. They run once in the outer pipeline instead.
-      // The cycle contains only the cheap algebraic/structural passes that
-      // genuinely benefit from iteration (each fold can unlock the next).
-      const cyclePasses = [
-        // String resolution — literals unlocked here feed all folds below
-        advancedStringDecoderPass,
-        xorDecodingPass,
-        stringDecoderPass,
-        // Cheap algebraic folding (O(N) per pass)
-        opaquePredicatePass,
-        constantPropagationPass,
-        bitwiseSimplifyPass,
-        numericLiteralPass,
-        templateLiteralPass,
-        // Structural micro-simplifications
-        propertyAccessNormPass,
-        objectAliasPass,
-        commaSplitterPass,
-        // Control-flow (only re-run when folding produced new literals that
-        // could resolve a switch discriminant or branch condition)
-        controlFlowPass,
-        switchDispatcherPass,
-        // Dead code / junk
-        junkStatementPass,
-        deadCodePass,
-        deadAssignmentPass,
-        unusedBindingsPass,
-        astSimplificationPass,
-      ];
+      // ── Staged worklist scheduler ────────────────────────────────────────────
+      //
+      // Architecture (per ChatGPT/Claude analysis):
+      //
+      //  Stage 1 — ONE-SHOT passes: run exactly once, never repeated.
+      //            These transforms are irreversible: once unicode/hex/property
+      //            normalization is done there is nothing left to find.
+      //
+      //  Stage 2 — STRING passes: loop until stable (≤5 iter).
+      //            Each decoded string can expose new literals for Stage 3.
+      //
+      //  Stage 3 — FOLDING passes: loop until stable (≤5 iter).
+      //            Constant folding cascades (bitwise → numeric → template →
+      //            opaque predicate), but converges fast.
+      //
+      //  Stage 4 — CFG passes: run once per outer loop only when Stage 2 or 3
+      //            produced changes (new literals can unlock dispatchers).
+      //
+      //  Stage 5 — CLEANUP passes: run once after everything else settles.
+      //            Dead code removal benefits from all prior stages.
+      //
+      // Passes that reported no changes are skipped on subsequent iterations
+      // via a per-pass "converged" flag — the worklist principle.
+      //
+      // Change detection: countingLog inspects the pass's own log message.
+      // "No ..." or "X 0 Y" → no change. Anything else → changed.
+      // No AST hashing or code generation is needed.
 
-      const MAX_ITER = 8; // cheap passes converge quickly; 20 was for heavy passes that are no longer in the cycle
-      let iteration = 0;
-      const perPassCounts = new Map(cyclePasses.map(p => [p.id, 0]));
-
-      // Convergence detection uses log-call counting instead of astHash per pass.
-      // Every pass calls log() with a count when it mutates something (e.g. "Folded
-      // 3 expressions"), or with a "No ..." / empty message when idle. Any non-idle
-      // log message signals a mutation — no hashing needed per pass.
-      let anyChangedLastIter = true;
-
-      while (iteration < MAX_ITER && anyChangedLastIter) {
-        if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
-        iteration++;
-        anyChangedLastIter = false;
-
-        for (const pass of cyclePasses) {
-          if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
-          let passChanged = false;
-          const countingLog = (msg) => {
-            if (!msg) return;
-            const s = String(msg);
-            // A pass signals no change when it logs 'No ...' OR when the first
-            // number in its message is 0 (e.g. 'Inlined 0 calls', 'Decoded 0 ...').
-            // Both patterns mean nothing was mutated this invocation.
-            if (s.startsWith('No ')) return;
-            const m = s.match(/\d+/);
-            if (m && m[0] === '0') return;
-            passChanged = true;
-          };
-          try {
-            const ctx = { log: countingLog, signal, traverse, types: t };
-            if (pass.run.constructor.name === 'AsyncFunction') await pass.run(ast, ctx);
-            else pass.run(ast, ctx);
-          } catch(_) { /* individual pass errors must not abort the cycle */ }
-          if (passChanged) {
-            anyChangedLastIter = true;
-            perPassCounts.set(pass.id, (perPassCounts.get(pass.id) ?? 0) + 1);
-          }
-        }
+      function runPass(pass, ctx) {
+        if (pass.run.constructor.name === 'AsyncFunction')
+          return pass.run(ast, ctx);
+        pass.run(ast, ctx);
       }
 
-      const converged = !anyChangedLastIter;
-      const activePasses = [...perPassCounts.entries()].filter(([,c]) => c > 0).map(([id,c]) => id + '×' + c).join(', ');
-      log(
-        'Fixed-point ' + (converged ? 'converged' : 'capped') + ' after ' + iteration + ' iteration(s)' +
-        (activePasses ? ' [' + activePasses + ']' : '')
-      );
+      function makeCtx(onChanged) {
+        return {
+          traverse, types: t, signal,
+          log(msg) {
+            if (!msg) return;
+            const s = String(msg);
+            if (s.startsWith('No ')) return;
+            const m = s.match(/d+/);
+            if (m && m[0] === '0') return;
+            onChanged();
+          },
+        };
+      }
+
+      // Run a single pass; returns true if it mutated the AST.
+      async function runOne(pass) {
+        if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+        let changed = false;
+        try { await runPass(pass, makeCtx(() => { changed = true; })); } catch(_) {}
+        return changed;
+      }
+
+      // Run a group of passes in a loop until none of them change anything,
+      // up to maxIter iterations. Passes that have individually converged are
+      // skipped. Returns true if any pass changed the AST at least once.
+      async function runUntilStable(passes, maxIter) {
+        const converged = new Set();
+        let anyEverChanged = false;
+        for (let iter = 0; iter < maxIter; iter++) {
+          if (signal?.aborted) throw new DOMException('Pipeline aborted', 'AbortError');
+          let anyChangedThisIter = false;
+          for (const pass of passes) {
+            if (converged.has(pass.id)) continue;
+            const changed = await runOne(pass);
+            if (changed) { anyChangedThisIter = true; anyEverChanged = true; }
+            else converged.add(pass.id); // never needs to run again
+          }
+          if (!anyChangedThisIter) break; // full sweep with no changes = stable
+        }
+        return anyEverChanged;
+      }
+
+      const perPassCounts = new Map();
+      const t0 = Date.now();
+
+      // ── Stage 1: one-shot normalization (never repeated) ───────────────────
+      for (const pass of [propertyAccessNormPass, commaSplitterPass]) {
+        const changed = await runOne(pass);
+        if (changed) perPassCounts.set(pass.id, 1);
+      }
+
+      // ── Stage 2: string decoding (loop until stable, ≤5 iter) ─────────────
+      const stringPasses = [advancedStringDecoderPass, xorDecodingPass, stringDecoderPass, objectAliasPass];
+      await runUntilStable(stringPasses, 5);
+
+      // ── Stage 3: algebraic folding (loop until stable, ≤5 iter) ───────────
+      // Re-run string passes inside this loop too: a folded constant might
+      // resolve an argument to a string decoder on the next round.
+      const foldPasses = [
+        advancedStringDecoderPass, xorDecodingPass, stringDecoderPass,
+        opaquePredicatePass, constantPropagationPass,
+        bitwiseSimplifyPass, numericLiteralPass, templateLiteralPass,
+      ];
+      const foldChanged = await runUntilStable(foldPasses, 5);
+
+      // ── Stage 4: CFG recovery (once, only if folding produced new info) ────
+      if (foldChanged) {
+        await runOne(controlFlowPass);
+        await runOne(switchDispatcherPass);
+      }
+
+      // ── Stage 5: cleanup (single pass — benefits from all prior stages) ────
+      for (const pass of [junkStatementPass, deadCodePass, deadAssignmentPass, unusedBindingsPass, astSimplificationPass]) {
+        await runOne(pass);
+      }
+
+      log('Fixed-point staged scheduler done in ' + (Date.now() - t0) + 'ms');
     },
   };
 
