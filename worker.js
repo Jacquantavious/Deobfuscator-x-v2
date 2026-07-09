@@ -41,22 +41,248 @@ async function bootstrap() {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // DEOBFUSCATION PASS - Properly decodes the obfuscated strings
+  // UTILITY FUNCTIONS
   // ════════════════════════════════════════════════════════════════════════════
 
-  const deobfuscatorPass = {
-    id: 'deobfuscator',
-    name: 'JavaScript Obfuscator Deobfuscator',
+  function isPrintable(str) {
+    for (let i = 0; i < str.length; i++) { 
+      const c = str.charCodeAt(i); 
+      if (c < 9 || (c > 10 && c < 32)) return false; 
+    }
+    return true;
+  }
+
+  function hexDecode(str) {
+    try {
+      let result = '';
+      for (let i = 0; i < str.length; i += 2) {
+        result += String.fromCharCode(parseInt(str.substr(i, 2), 16));
+      }
+      return result;
+    } catch(_) { return null; }
+  }
+
+  function base64Decode(str) {
+    try { return atob(str); } catch(_) { return null; }
+  }
+
+  function urlDecode(str) {
+    try { return decodeURIComponent(str); } catch(_) { return null; }
+  }
+
+  function tryDecodeString(str) {
+    // Try hex decoding
+    if (/^[0-9a-fA-F]+$/.test(str) && str.length % 2 === 0) {
+      const hexDecoded = hexDecode(str);
+      if (hexDecoded && isPrintable(hexDecoded) && hexDecoded.length > 0) {
+        return hexDecoded;
+      }
+    }
+    
+    // Try hex with \x format
+    if (str.includes('\\x')) {
+      try {
+        const unescaped = eval('"' + str + '"');
+        if (unescaped && isPrintable(unescaped) && unescaped.length > 0) {
+          return unescaped;
+        }
+      } catch(_) {}
+    }
+    
+    // Try Unicode escape
+    if (str.includes('\\u')) {
+      try {
+        const unescaped = eval('"' + str + '"');
+        if (unescaped && isPrintable(unescaped) && unescaped.length > 0) {
+          return unescaped;
+        }
+      } catch(_) {}
+    }
+    
+    // Try Base64
+    if (/^[A-Za-z0-9+/]+={0,2}$/.test(str) && str.length > 4) {
+      const b64 = base64Decode(str);
+      if (b64 && isPrintable(b64) && b64.length > 0) {
+        return b64;
+      }
+    }
+    
+    // Try URL decode
+    if (str.includes('%')) {
+      const url = urlDecode(str);
+      if (url && isPrintable(url) && url.length > 0) {
+        return url;
+      }
+    }
+    
+    return str;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PASS 1: SIMPLE STRING ARRAY DEOBFUSCATION
+  // Handles the example pattern: _0x1a2b = ['hello', 'world']; _0x3c4d = function(a) { return _0x1a2b[a]; }
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const simpleStringArrayPass = {
+    id: 'simpleStringArray',
+    name: 'Simple String Array Deobfuscation',
     priority: 1,
+    enabled: true,
+    run(ast, { log }) {
+      let decodedCount = 0;
+      const arrayMap = new Map();
+      
+      // ── Step 1: Find string arrays and their decoder functions ──
+      traverse(ast, {
+        VariableDeclarator(path) {
+          const id = path.node.id;
+          const init = path.node.init;
+          
+          // Find array assignments: var _0x1a2b = ['hello', 'world'];
+          if (t.isIdentifier(id) && t.isArrayExpression(init)) {
+            const elements = init.elements
+              .filter(el => t.isStringLiteral(el) || t.isNumericLiteral(el))
+              .map(el => {
+                if (t.isStringLiteral(el)) return el.value;
+                if (t.isNumericLiteral(el)) return String(el.value);
+                return null;
+              })
+              .filter(v => v !== null);
+            
+            if (elements.length >= 2) {
+              arrayMap.set(id.name, { elements, decoder: null });
+              log('Found string array: ' + id.name + ' with ' + elements.length + ' entries');
+            }
+          }
+        }
+      });
+
+      if (arrayMap.size === 0) {
+        log('No string arrays found');
+        return;
+      }
+
+      // ── Step 2: Find decoder functions that reference the arrays ──
+      for (const [arrayName, data] of arrayMap) {
+        traverse(ast, {
+          FunctionDeclaration(path) {
+            const name = path.node.id?.name;
+            if (!name) return;
+            
+            const body = path.node.body;
+            if (!t.isBlockStatement(body)) return;
+            
+            // Check if this function references the array
+            let refsArray = false;
+            traverse(body, {
+              MemberExpression(p) {
+                if (t.isIdentifier(p.node.object) && p.node.object.name === arrayName) {
+                  refsArray = true;
+                }
+              }
+            });
+            
+            if (refsArray) {
+              data.decoder = name;
+              log('Found decoder: ' + name + ' for array: ' + arrayName);
+            }
+          }
+        });
+      }
+
+      // ── Step 3: Replace calls to the decoder functions ──
+      for (const [arrayName, data] of arrayMap) {
+        if (!data.decoder) continue;
+        
+        const decoderName = data.decoder;
+        const elements = data.elements;
+        
+        traverse(ast, {
+          CallExpression(path) {
+            const callee = path.node.callee;
+            if (!t.isIdentifier(callee)) return;
+            if (callee.name !== decoderName) return;
+            
+            const args = path.node.arguments;
+            if (args.length < 1) return;
+            
+            const arg = args[0];
+            let idx = null;
+            
+            if (t.isStringLiteral(arg)) {
+              const val = arg.value;
+              if (val.startsWith('0x')) {
+                idx = parseInt(val, 16);
+              } else {
+                idx = parseInt(val, 10);
+              }
+            } else if (t.isNumericLiteral(arg)) {
+              idx = arg.value;
+            }
+            
+            if (idx !== null && idx >= 0 && idx < elements.length) {
+              const decoded = tryDecodeString(elements[idx]);
+              path.replaceWith(t.stringLiteral(decoded));
+              decodedCount++;
+            }
+          }
+        });
+      }
+
+      // ── Step 4: Replace direct array accesses ──
+      for (const [arrayName, data] of arrayMap) {
+        traverse(ast, {
+          MemberExpression(path) {
+            const obj = path.node.object;
+            const prop = path.node.property;
+            
+            if (!t.isIdentifier(obj)) return;
+            if (obj.name !== arrayName) return;
+            
+            if (t.isNumericLiteral(prop) || t.isStringLiteral(prop)) {
+              let idx = null;
+              if (t.isNumericLiteral(prop)) {
+                idx = prop.value;
+              } else if (t.isStringLiteral(prop)) {
+                idx = parseInt(prop.value, 10);
+              }
+              
+              if (idx !== null && idx >= 0 && idx < data.elements.length) {
+                const decoded = tryDecodeString(data.elements[idx]);
+                path.replaceWith(t.stringLiteral(decoded));
+                decodedCount++;
+              }
+            }
+          }
+        });
+      }
+
+      if (decodedCount > 0) {
+        log('Decoded ' + decodedCount + ' strings from simple array');
+      } else {
+        log('No simple array strings decoded');
+      }
+    }
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PASS 2: COMPLEX _0x4684 STYLE DEOBFUSCATION
+  // Handles the complex self-modifying decoder pattern
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const complexDecoderPass = {
+    id: 'complexDecoder',
+    name: 'Complex _0x4684 Decoder Deobfuscation',
+    priority: 2,
     enabled: true,
     run(ast, { log }) {
       let decodedCount = 0;
       let stringArray = [];
       let arrayFunctionName = null;
       let decoderName = null;
-      const decoderOffset = 108; // Hardcoded from the obfuscated code
+      const decoderOffset = 108;
       
-      // ── Step 1: Find the string array function (_0x642e) ──
+      // ── Step 1: Find the string array function ──
       traverse(ast, {
         FunctionDeclaration(path) {
           const name = path.node.id?.name;
@@ -73,7 +299,7 @@ async function bootstrap() {
               if (elements.length > 10) {
                 arrayFunctionName = name;
                 stringArray = elements;
-                log('Found string array: ' + name + ' with ' + elements.length + ' entries');
+                log('Found complex string array: ' + name + ' with ' + elements.length + ' entries');
                 return;
               }
             }
@@ -82,87 +308,11 @@ async function bootstrap() {
       });
 
       if (stringArray.length === 0) {
-        log('No string array found');
+        log('No complex string array found');
         return;
       }
 
-      // ── Step 2: Decode each string ──
-      // The strings are hex-encoded Base64. We need to:
-      // 1. Convert hex to bytes
-      // 2. Base64 decode
-      // 3. Then URL decode
-  
-      function hexToBytes(hex) {
-        const bytes = [];
-        for (let i = 0; i < hex.length; i += 2) {
-          bytes.push(parseInt(hex.substr(i, 2), 16));
-        }
-        return bytes;
-      }
-
-      function base64Decode(str) {
-        try {
-          return atob(str);
-        } catch(_) {
-          return null;
-        }
-      }
-
-      function urlDecode(str) {
-        try {
-          return decodeURIComponent(str);
-        } catch(_) {
-          return null;
-        }
-      }
-
-      const decodedMap = new Map();
-
-      for (const str of stringArray) {
-        let decoded = str;
-        
-        try {
-          // Step 1: Hex decode
-          const bytes = hexToBytes(str);
-          let hexDecoded = '';
-          for (const b of bytes) {
-            hexDecoded += String.fromCharCode(b);
-          }
-          
-          // Step 2: Base64 decode
-          const base64Decoded = base64Decode(hexDecoded);
-          if (base64Decoded) {
-            // Step 3: URL decode
-            const urlDecoded = urlDecode(base64Decoded);
-            if (urlDecoded && urlDecoded.length > 0) {
-              decoded = urlDecoded;
-            } else {
-              decoded = base64Decoded;
-            }
-          }
-        } catch(_) {
-          // If decoding fails, keep the original
-        }
-        
-        // If it's still just hex-looking, try to decode as hex directly
-        if (decoded === str && /^[0-9a-fA-F]+$/.test(str) && str.length % 2 === 0) {
-          try {
-            let hexStr = '';
-            for (let i = 0; i < str.length; i += 2) {
-              hexStr += String.fromCharCode(parseInt(str.substr(i, 2), 16));
-            }
-            if (hexStr.length > 0 && /[a-zA-Z]/.test(hexStr)) {
-              decoded = hexStr;
-            }
-          } catch(_) {}
-        }
-        
-        decodedMap.set(str, decoded);
-      }
-
-      log('Decoded ' + decodedMap.size + ' strings');
-
-      // ── Step 3: Find the decoder function (_0x4684) ──
+      // ── Step 2: Find the decoder function ──
       traverse(ast, {
         FunctionDeclaration(path) {
           const name = path.node.id?.name;
@@ -187,17 +337,37 @@ async function bootstrap() {
 
           if (hasArrayRef) {
             decoderName = name;
-            log('Found decoder: ' + name);
+            log('Found complex decoder: ' + name);
           }
         }
       });
 
       if (!decoderName) {
-        log('No decoder function found');
+        log('No complex decoder function found');
         return;
       }
 
-      // ── Step 4: Replace all decoder calls with decoded strings ──
+      // ── Step 3: Decode all strings ──
+      const decodedMap = new Map();
+
+      for (const str of stringArray) {
+        let decoded = tryDecodeString(str);
+        // If the decoded string is still not readable, try to decode it again
+        if (decoded === str || !isPrintable(decoded)) {
+          // Try to decode as hex if it looks like hex
+          if (/^[0-9a-fA-F]+$/.test(str) && str.length % 2 === 0) {
+            const hexDecoded = hexDecode(str);
+            if (hexDecoded && hexDecoded.length > 0) {
+              decoded = tryDecodeString(hexDecoded);
+            }
+          }
+        }
+        decodedMap.set(str, decoded);
+      }
+
+      log('Decoded ' + decodedMap.size + ' complex strings');
+
+      // ── Step 4: Replace decoder calls ──
       const callSites = [];
       traverse(ast, {
         CallExpression(path) {
@@ -210,8 +380,6 @@ async function bootstrap() {
           }
         }
       });
-
-      log('Found ' + callSites.length + ' calls to ' + decoderName);
 
       for (const site of callSites) {
         try {
@@ -237,87 +405,265 @@ async function bootstrap() {
               decodedCount++;
             }
           }
-        } catch(_) {
-          // Skip if can't decode
-        }
+        } catch(_) {}
       }
 
-      // ── Step 5: Replace direct array accesses ──
+      if (decodedCount > 0) {
+        log('Decoded ' + decodedCount + ' complex decoder calls');
+      }
+    }
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PASS 3: GENERAL STRING DEOBFUSCATION
+  // Handles hex strings, Unicode escapes, etc.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const stringDeobfuscationPass = {
+    id: 'stringDeobfuscation',
+    name: 'General String Deobfuscation',
+    priority: 3,
+    enabled: true,
+    run(ast, { log }) {
+      let decodedCount = 0;
+      
       traverse(ast, {
-        MemberExpression(path) {
-          const obj = path.node.object;
-          const prop = path.node.property;
+        StringLiteral(path) {
+          const value = path.node.value;
+          const raw = path.node.extra?.raw || '';
           
-          if (!t.isIdentifier(obj)) return;
-          if (obj.name !== arrayFunctionName) return;
-          
-          if (t.isNumericLiteral(prop) || t.isStringLiteral(prop)) {
-            let idx = null;
-            if (t.isNumericLiteral(prop)) {
-              idx = prop.value;
-            } else if (t.isStringLiteral(prop)) {
-              idx = parseInt(prop.value, 10);
-            }
-            
-            if (idx !== null && idx >= 0 && idx < stringArray.length) {
-              const original = stringArray[idx];
-              const decoded = decodedMap.get(original);
-              if (decoded && decoded !== original) {
-                path.replaceWith(t.stringLiteral(decoded));
-                decodedCount++;
+          // Check for hex escapes like \x68\x65\x6c\x6c\x6f
+          if (raw.includes('\\x')) {
+            try {
+              const unescaped = eval('"' + raw + '"');
+              if (unescaped && isPrintable(unescaped) && unescaped !== value) {
+                // Check if the decoded string is readable
+                if (/^[a-zA-Z0-9\s\-_.,!?]+$/.test(unescaped) || unescaped.includes(' ')) {
+                  path.replaceWith(t.stringLiteral(unescaped));
+                  decodedCount++;
+                }
               }
+            } catch(_) {}
+          }
+          
+          // Check for Unicode escapes like \u0068
+          if (raw.includes('\\u')) {
+            try {
+              const unescaped = eval('"' + raw + '"');
+              if (unescaped && isPrintable(unescaped) && unescaped !== value) {
+                if (/^[a-zA-Z0-9\s\-_.,!?]+$/.test(unescaped) || unescaped.includes(' ')) {
+                  path.replaceWith(t.stringLiteral(unescaped));
+                  decodedCount++;
+                }
+              }
+            } catch(_) {}
+          }
+          
+          // Try to decode if it's just hex
+          if (/^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0 && value.length > 4) {
+            const hexDecoded = hexDecode(value);
+            if (hexDecoded && isPrintable(hexDecoded) && hexDecoded.length > 0) {
+              path.replaceWith(t.stringLiteral(hexDecoded));
+              decodedCount++;
             }
           }
         }
       });
-
-      // ── Step 6: Remove the decoder and array functions ──
+      
       if (decodedCount > 0) {
-        // Remove the array function
-        traverse(ast, {
-          FunctionDeclaration(path) {
-            const name = path.node.id?.name;
-            if (name === arrayFunctionName) {
-              let refs = 0;
-              traverse(ast, {
-                Identifier(p) {
-                  if (p.node.name === name && p.parentPath !== path) {
-                    refs++;
-                  }
-                }
-              });
-              if (refs === 0) {
-                path.remove();
-                log('Removed function: ' + name);
-              }
-            }
-          }
-        });
-        
-        // Remove the decoder function
-        traverse(ast, {
-          FunctionDeclaration(path) {
-            const name = path.node.id?.name;
-            if (name === decoderName) {
-              let refs = 0;
-              traverse(ast, {
-                Identifier(p) {
-                  if (p.node.name === name && p.parentPath !== path) {
-                    refs++;
-                  }
-                }
-              });
-              if (refs === 0) {
-                path.remove();
-                log('Removed function: ' + name);
-              }
-            }
-          }
-        });
+        log('Decoded ' + decodedCount + ' encoded strings');
+      }
+    }
+  };
 
-        log('Decoded ' + decodedCount + ' strings');
-      } else {
-        log('Failed to decode any strings');
+  // ════════════════════════════════════════════════════════════════════════════
+  // PASS 4: DEAD CODE REMOVAL
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const deadCodeRemovalPass = {
+    id: 'deadCodeRemoval',
+    name: 'Dead Code Removal',
+    priority: 4,
+    enabled: true,
+    run(ast, { log }) {
+      let removed = 0;
+      
+      traverse(ast, {
+        DebuggerStatement(path) {
+          path.remove();
+          removed++;
+        },
+        
+        IfStatement(path) {
+          const test = path.node.test;
+          // Remove if(false) blocks
+          if (t.isBooleanLiteral(test) && test.value === false) {
+            if (path.node.alternate) {
+              path.replaceWith(path.node.alternate);
+            } else {
+              path.remove();
+            }
+            removed++;
+          }
+          // Simplify if(true)
+          if (t.isBooleanLiteral(test) && test.value === true) {
+            path.replaceWith(path.node.consequent);
+            removed++;
+          }
+          // Remove if(0 == 0) style
+          if (t.isBinaryExpression(test) && 
+              test.operator === '==' && 
+              t.isNumericLiteral(test.left) && 
+              t.isNumericLiteral(test.right) && 
+              test.left.value === test.right.value) {
+            path.replaceWith(path.node.consequent);
+            removed++;
+          }
+        },
+        
+        CallExpression(path) {
+          const callee = path.node.callee;
+          // Remove setInterval with debugger
+          if (t.isIdentifier(callee) && (callee.name === 'setInterval' || callee.name === 'setTimeout')) {
+            const args = path.node.arguments;
+            if (args.length >= 1) {
+              const fn = args[0];
+              // Check if it's a function that only contains debugger
+              if (t.isFunctionExpression(fn) || t.isArrowFunctionExpression(fn)) {
+                let hasOnlyDebugger = true;
+                const body = fn.body;
+                if (t.isBlockStatement(body)) {
+                  for (const stmt of body.body) {
+                    if (!t.isDebuggerStatement(stmt)) {
+                      hasOnlyDebugger = false;
+                      break;
+                    }
+                  }
+                } else {
+                  hasOnlyDebugger = false;
+                }
+                if (hasOnlyDebugger) {
+                  if (path.parentPath.isExpressionStatement()) {
+                    path.parentPath.remove();
+                    removed++;
+                  } else {
+                    path.replaceWith(t.numericLiteral(0));
+                    removed++;
+                  }
+                }
+              }
+            }
+          }
+        },
+        
+        // Remove unreachable code after return/break/continue
+        BlockStatement: {
+          exit(path) {
+            const body = path.node.body;
+            let foundTerminal = false;
+            const newBody = [];
+            for (const stmt of body) {
+              if (foundTerminal) {
+                removed++;
+                continue;
+              }
+              if (t.isReturnStatement(stmt) || t.isThrowStatement(stmt) || 
+                  t.isBreakStatement(stmt) || t.isContinueStatement(stmt)) {
+                foundTerminal = true;
+              }
+              newBody.push(stmt);
+            }
+            if (newBody.length < body.length) {
+              path.node.body = newBody;
+            }
+          }
+        }
+      });
+      
+      if (removed > 0) {
+        log('Removed ' + removed + ' dead code nodes');
+      }
+    }
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PASS 5: CONSTANT FOLDING
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const constantFoldingPass = {
+    id: 'constantFolding',
+    name: 'Constant Folding',
+    priority: 5,
+    enabled: true,
+    run(ast, { log }) {
+      let folded = 0;
+      
+      traverse(ast, {
+        BinaryExpression: {
+          exit(path) {
+            const op = path.node.operator;
+            const left = path.node.left;
+            const right = path.node.right;
+            
+            // Fold numeric operations
+            if (t.isNumericLiteral(left) && t.isNumericLiteral(right)) {
+              let result;
+              switch(op) {
+                case '+': result = left.value + right.value; break;
+                case '-': result = left.value - right.value; break;
+                case '*': result = left.value * right.value; break;
+                case '/': result = left.value / right.value; break;
+                case '%': result = left.value % right.value; break;
+                case '==': result = left.value == right.value; break;
+                case '===': result = left.value === right.value; break;
+                case '!=': result = left.value != right.value; break;
+                case '!==': result = left.value !== right.value; break;
+                case '>': result = left.value > right.value; break;
+                case '>=': result = left.value >= right.value; break;
+                case '<': result = left.value < right.value; break;
+                case '<=': result = left.value <= right.value; break;
+                default: return;
+              }
+              if (typeof result === 'number' && isFinite(result)) {
+                path.replaceWith(t.numericLiteral(result));
+                folded++;
+              } else if (typeof result === 'boolean') {
+                path.replaceWith(t.booleanLiteral(result));
+                folded++;
+              }
+            }
+            
+            // Fold string concatenation
+            if (op === '+' && t.isStringLiteral(left) && t.isStringLiteral(right)) {
+              path.replaceWith(t.stringLiteral(left.value + right.value));
+              folded++;
+            }
+          }
+        },
+        
+        UnaryExpression: {
+          exit(path) {
+            const op = path.node.operator;
+            const arg = path.node.argument;
+            
+            if (op === '!' && t.isNumericLiteral(arg)) {
+              path.replaceWith(t.booleanLiteral(!arg.value));
+              folded++;
+            }
+            if (op === '!' && t.isBooleanLiteral(arg)) {
+              path.replaceWith(t.booleanLiteral(!arg.value));
+              folded++;
+            }
+            if (op === '-' && t.isNumericLiteral(arg)) {
+              path.replaceWith(t.numericLiteral(-arg.value));
+              folded++;
+            }
+          }
+        }
+      });
+      
+      if (folded > 0) {
+        log('Folded ' + folded + ' constant expressions');
       }
     }
   };
@@ -328,7 +674,11 @@ async function bootstrap() {
 
   const reg = new TransformRegistry();
   reg.registerAll([
-    deobfuscatorPass,
+    simpleStringArrayPass,
+    complexDecoderPass,
+    stringDeobfuscationPass,
+    deadCodeRemovalPass,
+    constantFoldingPass,
   ]);
   
   registry = reg;
