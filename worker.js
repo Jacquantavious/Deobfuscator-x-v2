@@ -135,6 +135,20 @@ async function bootstrap() {
     return { ok: false };
   }
 
+  function resolveIndex(property, computed) {
+    if (!computed) return null;
+    if (t.isNumericLiteral(property)) return property.value;
+    if (t.isStringLiteral(property)) { const n = parseInt(property.value, 10); return isNaN(n) ? null : n; }
+    if (t.isBinaryExpression(property)) {
+      const { operator, left, right } = property;
+      if (t.isNumericLiteral(left) && t.isNumericLiteral(right)) {
+        if (operator === '+') return left.value + right.value;
+        if (operator === '-') return left.value - right.value;
+      }
+    }
+    return null;
+  }
+
   // ════════════════════════════════════════════════════════════════════════════
   // PASS 1: UNIVERSAL DECODER 
   // ════════════════════════════════════════════════════════════════════════════
@@ -147,7 +161,6 @@ async function bootstrap() {
     run(ast, { log }) {
       let inlined = 0;
       
-      // Step 1: Find the string array function (usually _0x642e)
       let arrayFunctionName = null;
       let stringArray = [];
       
@@ -180,7 +193,6 @@ async function bootstrap() {
         return;
       }
       
-      // Step 2: Find the decoder function (usually _0x4684 or similar)
       let decoderName = null;
       let decoderOffset = 0;
       let arrayVarName = null;
@@ -232,7 +244,6 @@ async function bootstrap() {
         return;
       }
       
-      // Step 3: Collect all call sites
       const callSites = [];
       traverse(ast, {
         CallExpression(path) {
@@ -259,7 +270,6 @@ async function bootstrap() {
       
       log('Found ' + callSites.length + ' calls to ' + decoderName);
       
-      // Step 4: Extract source code for sandbox evaluation
       let decoderSource = '';
       let arraySource = '';
       
@@ -283,7 +293,6 @@ async function bootstrap() {
         return;
       }
       
-      // Step 5: Evaluate each call site
       let evaluated = 0;
       
       for (const site of callSites) {
@@ -343,7 +352,6 @@ async function bootstrap() {
           if (typeof result === 'string' && result.length > 0) {
             let decoded = result;
             
-            // Check for Base64
             if (/^[A-Za-z0-9+/]+={0,2}$/.test(decoded)) {
               try {
                 const base64Decoded = atob(decoded);
@@ -353,7 +361,6 @@ async function bootstrap() {
               } catch(_) {}
             }
             
-            // Check for URL encoding
             if (decoded.includes('%')) {
               try {
                 const urlDecoded = decodeURIComponent(decoded);
@@ -373,7 +380,6 @@ async function bootstrap() {
       
       inlined = evaluated;
       
-      // Step 6: Clean up unused functions
       if (inlined > 0) {
         let arrayRefs = 0;
         traverse(ast, {
@@ -508,7 +514,6 @@ async function bootstrap() {
       let resolved = 0;
       const decodedMap = new Map();
       
-      // Find the string array
       let arrayFunctionName = null;
       
       traverse(ast, {
@@ -539,7 +544,6 @@ async function bootstrap() {
         return;
       }
       
-      // Find the decoder
       let decoderName = null;
       let decoderOffset = 0;
       
@@ -589,7 +593,6 @@ async function bootstrap() {
         return;
       }
       
-      // Extract source
       let decoderSource = '';
       let arraySource = '';
       
@@ -608,7 +611,6 @@ async function bootstrap() {
         }
       });
       
-      // Find obfuscated property names
       const obfuscatedStrings = new Set();
       traverse(ast, {
         StringLiteral(path) {
@@ -619,7 +621,6 @@ async function bootstrap() {
         }
       });
       
-      // Decode each
       for (const str of obfuscatedStrings) {
         try {
           for (const offset of [decoderOffset, decoderOffset - 1, decoderOffset + 1, 108, 0]) {
@@ -651,7 +652,6 @@ async function bootstrap() {
         }
       }
       
-      // Replace
       if (decodedMap.size > 0) {
         traverse(ast, {
           StringLiteral(path) {
@@ -664,9 +664,6 @@ async function bootstrap() {
                 path.replaceWith(t.identifier(decoded));
                 resolved++;
               } else if (t.isObjectProperty(parent) && parent.key === path.node && !parent.computed) {
-                path.replaceWith(t.identifier(decoded));
-                resolved++;
-              } else if (t.isProperty(parent) && parent.key === path.node) {
                 path.replaceWith(t.identifier(decoded));
                 resolved++;
               }
@@ -684,7 +681,7 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
-  // RUNTIME PATTERN PASS
+  // PASS 4: RUNTIME PATTERN PASS
   // ════════════════════════════════════════════════════════════════════════════
 
   const runtimePatternPass = {
@@ -731,7 +728,7 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
-  // ZEROX DECODER PASS
+  // PASS 5: ZEROX DECODER PASS
   // ════════════════════════════════════════════════════════════════════════════
 
   function analyzeDecoderFunction(path2, stringArrays, decoders) {
@@ -844,7 +841,7 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
-  // SANDOX DECODER PASS
+  // PASS 6: SANDOX DECODER PASS
   // ════════════════════════════════════════════════════════════════════════════
 
   const sandboxDecoderPass = {
@@ -970,6 +967,60 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
+  // PASS 7: STRING ARRAY CLEANUP PASS
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const stringArrayCleanupPass = {
+    id: 'stringArrayCleanup', name: 'Massive String Array Cleanup', priority: 6, enabled: true,
+    run(ast, { log }) {
+      let inlined = 0, arraysRemoved = 0;
+      const candidates = new Map();
+      traverse(ast, {
+        VariableDeclarator(path2) {
+          const { id, init } = path2.node;
+          if (!t.isIdentifier(id) || !t.isArrayExpression(init) || init.elements.length < 2) return;
+          const elements = init.elements.map(el => {
+            if (t.isStringLiteral(el)) return el.value;
+            if (t.isNumericLiteral(el)) return el.value;
+            if (t.isNullLiteral(el)) return null;
+            return undefined;
+          });
+          const sc = elements.filter(e => typeof e === 'string').length;
+          if (sc / elements.length < 0.5 || elements.some(e => e === undefined)) return;
+          candidates.set(id.name, elements);
+        },
+      });
+      if (candidates.size === 0) { log('No large string arrays found'); return; }
+      log('Found ' + candidates.size + ' string array(s): ' + [...candidates.keys()].join(', '));
+      traverse(ast, {
+        MemberExpression(path2) {
+          if (!t.isIdentifier(path2.node.object)) return;
+          const name = path2.node.object.name;
+          if (!candidates.has(name)) return;
+          const arr = candidates.get(name);
+          const idx = resolveIndex(path2.node.property, path2.node.computed);
+          if (idx === null || idx < 0 || idx >= arr.length) return;
+          const val = arr[idx];
+          if (val === null) return;
+          if (typeof val === 'string') { path2.replaceWith(t.stringLiteral(val)); inlined++; }
+          else if (typeof val === 'number') { path2.replaceWith(t.numericLiteral(val)); inlined++; }
+        },
+      });
+      if (inlined > 0) {
+        traverse(ast, {
+          VariableDeclaration(path2) {
+            const prev = path2.node.declarations.length;
+            path2.node.declarations = path2.node.declarations.filter(d => !t.isIdentifier(d.id) || !candidates.has(d.id.name));
+            arraysRemoved += prev - path2.node.declarations.length;
+            if (path2.node.declarations.length === 0) path2.remove();
+          },
+        });
+      }
+      log('Inlined ' + inlined + ' array access(es), removed ' + arraysRemoved + ' array declaration(s)');
+    },
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
   // REGISTER ALL PASSES
   // ════════════════════════════════════════════════════════════════════════════
 
@@ -981,7 +1032,7 @@ async function bootstrap() {
     runtimePatternPass,
     zeroxDecoderPass,
     sandboxDecoderPass,
-    // Add your other passes here...
+    stringArrayCleanupPass,
   ]);
   
   registry = reg;
