@@ -41,7 +41,7 @@ async function bootstrap() {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // DEOBFUSCATION PASS - Actually runs the decoder in a sandbox
+  // DEOBFUSCATION PASS - Properly decodes the obfuscated strings
   // ════════════════════════════════════════════════════════════════════════════
 
   const deobfuscatorPass = {
@@ -54,6 +54,7 @@ async function bootstrap() {
       let stringArray = [];
       let arrayFunctionName = null;
       let decoderName = null;
+      const decoderOffset = 108; // Hardcoded from the obfuscated code
       
       // ── Step 1: Find the string array function (_0x642e) ──
       traverse(ast, {
@@ -85,9 +86,83 @@ async function bootstrap() {
         return;
       }
 
-      // ── Step 2: Find the decoder function (_0x4684) ──
-      let decoderSource = '';
-      
+      // ── Step 2: Decode each string ──
+      // The strings are hex-encoded Base64. We need to:
+      // 1. Convert hex to bytes
+      // 2. Base64 decode
+      // 3. Then URL decode
+  
+      function hexToBytes(hex) {
+        const bytes = [];
+        for (let i = 0; i < hex.length; i += 2) {
+          bytes.push(parseInt(hex.substr(i, 2), 16));
+        }
+        return bytes;
+      }
+
+      function base64Decode(str) {
+        try {
+          return atob(str);
+        } catch(_) {
+          return null;
+        }
+      }
+
+      function urlDecode(str) {
+        try {
+          return decodeURIComponent(str);
+        } catch(_) {
+          return null;
+        }
+      }
+
+      const decodedMap = new Map();
+
+      for (const str of stringArray) {
+        let decoded = str;
+        
+        try {
+          // Step 1: Hex decode
+          const bytes = hexToBytes(str);
+          let hexDecoded = '';
+          for (const b of bytes) {
+            hexDecoded += String.fromCharCode(b);
+          }
+          
+          // Step 2: Base64 decode
+          const base64Decoded = base64Decode(hexDecoded);
+          if (base64Decoded) {
+            // Step 3: URL decode
+            const urlDecoded = urlDecode(base64Decoded);
+            if (urlDecoded && urlDecoded.length > 0) {
+              decoded = urlDecoded;
+            } else {
+              decoded = base64Decoded;
+            }
+          }
+        } catch(_) {
+          // If decoding fails, keep the original
+        }
+        
+        // If it's still just hex-looking, try to decode as hex directly
+        if (decoded === str && /^[0-9a-fA-F]+$/.test(str) && str.length % 2 === 0) {
+          try {
+            let hexStr = '';
+            for (let i = 0; i < str.length; i += 2) {
+              hexStr += String.fromCharCode(parseInt(str.substr(i, 2), 16));
+            }
+            if (hexStr.length > 0 && /[a-zA-Z]/.test(hexStr)) {
+              decoded = hexStr;
+            }
+          } catch(_) {}
+        }
+        
+        decodedMap.set(str, decoded);
+      }
+
+      log('Decoded ' + decodedMap.size + ' strings');
+
+      // ── Step 3: Find the decoder function (_0x4684) ──
       traverse(ast, {
         FunctionDeclaration(path) {
           const name = path.node.id?.name;
@@ -112,108 +187,17 @@ async function bootstrap() {
 
           if (hasArrayRef) {
             decoderName = name;
-            try {
-              decoderSource = generate(path.node, { compact: false }).code;
-              log('Found decoder: ' + name);
-            } catch(_) {}
+            log('Found decoder: ' + name);
           }
         }
       });
 
-      if (!decoderName || !decoderSource) {
+      if (!decoderName) {
         log('No decoder function found');
         return;
       }
 
-      // ── Step 3: Build a sandbox with the decoder and array function ──
-      let arraySource = '';
-      traverse(ast, {
-        FunctionDeclaration(path) {
-          if (path.node.id?.name === arrayFunctionName) {
-            try {
-              arraySource = generate(path.node, { compact: false }).code;
-            } catch(_) {}
-          }
-        }
-      });
-
-      if (!arraySource) {
-        log('Failed to extract array source');
-        return;
-      }
-
-      // ── Step 4: Decode each string using the actual decoder ──
-      const decodedMap = new Map();
-      
-      // Build the sandbox code - this will execute the decoder with each index
-      for (let i = 0; i < stringArray.length; i++) {
-        try {
-          // The decoder expects an index like '0x7a' (hex string)
-          const hexIndex = '0x' + (i + 108).toString(16);
-          
-          const evalCode = `
-            (function() {
-              ${arraySource}
-              ${decoderSource}
-              // The decoder stores decoded strings in a cache
-              // We need to call it with the hex index
-              return ${decoderName}("${hexIndex}");
-            })()
-          `;
-          
-          let result;
-          try {
-            result = new Function('return ' + evalCode)();
-          } catch(_) {
-            // Try with the raw index
-            try {
-              const evalCode2 = `
-                (function() {
-                  ${arraySource}
-                  ${decoderSource}
-                  return ${decoderName}(${i + 108});
-                })()
-              `;
-              result = new Function('return ' + evalCode2)();
-            } catch(_2) {
-              continue;
-            }
-          }
-          
-          if (typeof result === 'string' && result.length > 0) {
-            // The result might still be encoded - try to decode it
-            let decoded = result;
-            
-            // Check for URL encoding
-            if (decoded.includes('%')) {
-              try {
-                const urlDecoded = decodeURIComponent(decoded);
-                if (urlDecoded.length > 0 && urlDecoded !== decoded) {
-                  decoded = urlDecoded;
-                }
-              } catch(_) {}
-            }
-            
-            // Check for escaped sequences
-            if (decoded.includes('\\x')) {
-              try {
-                const unescaped = eval('"' + decoded + '"');
-                if (unescaped.length > 0 && unescaped !== decoded) {
-                  decoded = unescaped;
-                }
-              } catch(_) {}
-            }
-            
-            decodedMap.set(stringArray[i], decoded);
-          }
-        } catch(_) {
-          // Skip this string if it can't be decoded
-        }
-      }
-
-      log('Decoded ' + decodedMap.size + ' strings');
-
-      // ── Step 5: Replace all decoder calls with decoded strings ──
+      // ── Step 4: Replace all decoder calls with decoded strings ──
       const callSites = [];
       traverse(ast, {
         CallExpression(path) {
@@ -237,18 +221,18 @@ async function bootstrap() {
           if (t.isStringLiteral(arg)) {
             const val = arg.value;
             if (val.startsWith('0x')) {
-              idx = parseInt(val, 16) - 108;
+              idx = parseInt(val, 16) - decoderOffset;
             } else {
-              idx = parseInt(val, 16) - 108;
+              idx = parseInt(val, 16) - decoderOffset;
             }
           } else if (t.isNumericLiteral(arg)) {
-            idx = arg.value - 108;
+            idx = arg.value - decoderOffset;
           }
 
           if (idx !== null && idx >= 0 && idx < stringArray.length) {
             const original = stringArray[idx];
             const decoded = decodedMap.get(original);
-            if (decoded) {
+            if (decoded && decoded !== original) {
               site.path.replaceWith(t.stringLiteral(decoded));
               decodedCount++;
             }
@@ -258,7 +242,7 @@ async function bootstrap() {
         }
       }
 
-      // ── Step 6: Replace direct array accesses ──
+      // ── Step 5: Replace direct array accesses ──
       traverse(ast, {
         MemberExpression(path) {
           const obj = path.node.object;
@@ -278,7 +262,7 @@ async function bootstrap() {
             if (idx !== null && idx >= 0 && idx < stringArray.length) {
               const original = stringArray[idx];
               const decoded = decodedMap.get(original);
-              if (decoded) {
+              if (decoded && decoded !== original) {
                 path.replaceWith(t.stringLiteral(decoded));
                 decodedCount++;
               }
@@ -287,17 +271,38 @@ async function bootstrap() {
         }
       });
 
-      // ── Step 7: Remove unused functions ──
+      // ── Step 6: Remove the decoder and array functions ──
       if (decodedCount > 0) {
+        // Remove the array function
         traverse(ast, {
           FunctionDeclaration(path) {
             const name = path.node.id?.name;
-            if (name === arrayFunctionName || name === decoderName) {
+            if (name === arrayFunctionName) {
               let refs = 0;
-              const targetName = name;
               traverse(ast, {
                 Identifier(p) {
-                  if (p.node.name === targetName && p.parentPath !== path) {
+                  if (p.node.name === name && p.parentPath !== path) {
+                    refs++;
+                  }
+                }
+              });
+              if (refs === 0) {
+                path.remove();
+                log('Removed function: ' + name);
+              }
+            }
+          }
+        });
+        
+        // Remove the decoder function
+        traverse(ast, {
+          FunctionDeclaration(path) {
+            const name = path.node.id?.name;
+            if (name === decoderName) {
+              let refs = 0;
+              traverse(ast, {
+                Identifier(p) {
+                  if (p.node.name === name && p.parentPath !== path) {
                     refs++;
                   }
                 }
@@ -312,51 +317,7 @@ async function bootstrap() {
 
         log('Decoded ' + decodedCount + ' strings');
       } else {
-        log('Failed to decode any strings - trying alternative approach');
-        
-        // ── Alternative: Try to decode using a simpler method ──
-        // Some strings might be directly Base64 encoded without the decoder
-        let altDecoded = 0;
-        for (const str of stringArray) {
-          try {
-            // Try Base64 decoding
-            const b64 = atob(str);
-            if (b64 && b64.length > 0 && /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(b64)) {
-              decodedMap.set(str, b64);
-              altDecoded++;
-            }
-          } catch(_) {}
-        }
-        
-        if (altDecoded > 0) {
-          log('Alternative decoding found ' + altDecoded + ' strings');
-          // Re-run the replacement with the alternative decoded strings
-          for (const site of callSites) {
-            try {
-              const arg = site.args[0];
-              let idx = null;
-              
-              if (t.isStringLiteral(arg)) {
-                const val = arg.value;
-                if (val.startsWith('0x')) {
-                  idx = parseInt(val, 16) - 108;
-                }
-              } else if (t.isNumericLiteral(arg)) {
-                idx = arg.value - 108;
-              }
-
-              if (idx !== null && idx >= 0 && idx < stringArray.length) {
-                const original = stringArray[idx];
-                const decoded = decodedMap.get(original);
-                if (decoded) {
-                  site.path.replaceWith(t.stringLiteral(decoded));
-                  decodedCount++;
-                }
-              }
-            } catch(_) {}
-          }
-          log('Decoded ' + decodedCount + ' total strings');
-        }
+        log('Failed to decode any strings');
       }
     }
   };
