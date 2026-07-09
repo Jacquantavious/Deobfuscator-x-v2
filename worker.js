@@ -136,7 +136,7 @@ async function bootstrap() {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // PASS 1: UNIVERSAL DECODER (NEW)
+  // PASS 1: UNIVERSAL DECODER 
   // ════════════════════════════════════════════════════════════════════════════
 
   const universalDecoderPass = {
@@ -146,7 +146,6 @@ async function bootstrap() {
     enabled: true,
     run(ast, { log }) {
       let inlined = 0;
-      let decodedStrings = new Map();
       
       // Step 1: Find the string array function (usually _0x642e)
       let arrayFunctionName = null;
@@ -312,9 +311,6 @@ async function bootstrap() {
               }
             });
             if (!resolved) {
-              // Try to resolve from the offset pattern
-              // The arg is often something like _0x37b3e5 which is the parameter
-              // In the actual call, it's a string literal like '0x0'
               continue;
             }
           }
@@ -367,19 +363,6 @@ async function bootstrap() {
               } catch(_) {}
             }
             
-            // Check for hex encoding
-            if (/^[0-9a-fA-F]{2,}$/.test(decoded) && decoded.length % 2 === 0) {
-              try {
-                let hexDecoded = '';
-                for (let i = 0; i < decoded.length; i += 2) {
-                  hexDecoded += String.fromCharCode(parseInt(decoded.substr(i, 2), 16));
-                }
-                if (isPrintable(hexDecoded) && hexDecoded.length > 0) {
-                  decoded = hexDecoded;
-                }
-              } catch(_) {}
-            }
-            
             site.path.replaceWith(t.stringLiteral(decoded));
             evaluated++;
           }
@@ -392,7 +375,6 @@ async function bootstrap() {
       
       // Step 6: Clean up unused functions
       if (inlined > 0) {
-        // Check references to the array function
         let arrayRefs = 0;
         traverse(ast, {
           Identifier(path) {
@@ -413,7 +395,6 @@ async function bootstrap() {
           });
         }
         
-        // Check references to the decoder function
         let decoderRefs = 0;
         traverse(ast, {
           Identifier(path) {
@@ -442,7 +423,7 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
-  // PASS 2: INFINITE LOOP REMOVAL (NEW)
+  // PASS 2: INFINITE LOOP REMOVAL
   // ════════════════════════════════════════════════════════════════════════════
 
   const infiniteLoopRemovalPass = {
@@ -464,29 +445,20 @@ async function bootstrap() {
           const body = path.node.body;
           if (!t.isBlockStatement(body)) return;
           
-          // Check if the body is empty or has no effect
           const hasEffect = body.body.some(stmt => {
             if (t.isDebuggerStatement(stmt)) return false;
             if (t.isExpressionStatement(stmt) && 
                 t.isCallExpression(stmt.expression) &&
                 t.isIdentifier(stmt.expression.callee, { name: 'debugger' })) return false;
-            // Check if it's just a function call that does nothing
-            if (t.isExpressionStatement(stmt) && t.isCallExpression(stmt.expression)) {
-              // If it's a call to the decoder with no side effects, it's safe to remove
-              return true;
-            }
             return true;
           });
           
-          // If there's any effect, keep it
           if (hasEffect) return;
           
-          // Remove the while loop
           path.remove();
           removed++;
         },
         
-        // Handle IIFE with while(true)
         CallExpression(path) {
           const callee = path.node.callee;
           if (!t.isFunctionExpression(callee) && !t.isArrowFunctionExpression(callee)) return;
@@ -494,9 +466,7 @@ async function bootstrap() {
           const body = callee.body;
           if (!t.isBlockStatement(body)) return;
           
-          // Check if the body contains only a while(true) with no effect
           let hasOnlyInfiniteLoop = true;
-          let hasEffect = false;
           
           for (const stmt of body.body) {
             if (t.isWhileStatement(stmt)) {
@@ -507,12 +477,10 @@ async function bootstrap() {
                 continue;
               }
             }
-            // If there's any other statement, keep it
             hasOnlyInfiniteLoop = false;
           }
           
           if (hasOnlyInfiniteLoop) {
-            // Remove the entire IIFE
             path.remove();
             removed++;
           }
@@ -528,7 +496,7 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
-  // PASS 3: PROPERTY NAME DEOBFUSCATION (NEW)
+  // PASS 3: PROPERTY NAME DEOBFUSCATION
   // ════════════════════════════════════════════════════════════════════════════
 
   const propertyNameDeobfuscationPass = {
@@ -540,9 +508,8 @@ async function bootstrap() {
       let resolved = 0;
       const decodedMap = new Map();
       
-      // Step 1: Find the string array
+      // Find the string array
       let arrayFunctionName = null;
-      let stringArray = [];
       
       traverse(ast, {
         FunctionDeclaration(path) {
@@ -559,7 +526,6 @@ async function bootstrap() {
                 .map(el => el.value);
               if (elements.length > 10) {
                 arrayFunctionName = name;
-                stringArray = elements;
                 log('Found property name array: ' + name + ' with ' + elements.length + ' entries');
                 break;
               }
@@ -568,12 +534,12 @@ async function bootstrap() {
         }
       });
       
-      if (stringArray.length === 0) {
+      if (!arrayFunctionName) {
         log('No property name array found');
         return;
       }
       
-      // Step 2: Find the decoder function
+      // Find the decoder
       let decoderName = null;
       let decoderOffset = 0;
       
@@ -623,7 +589,7 @@ async function bootstrap() {
         return;
       }
       
-      // Step 3: Extract source for evaluation
+      // Extract source
       let decoderSource = '';
       let arraySource = '';
       
@@ -642,7 +608,7 @@ async function bootstrap() {
         }
       });
       
-      // Step 4: Collect obfuscated property names
+      // Find obfuscated property names
       const obfuscatedStrings = new Set();
       traverse(ast, {
         StringLiteral(path) {
@@ -653,7 +619,7 @@ async function bootstrap() {
         }
       });
       
-      // Step 5: Decode each obfuscated string
+      // Decode each
       for (const str of obfuscatedStrings) {
         try {
           for (const offset of [decoderOffset, decoderOffset - 1, decoderOffset + 1, 108, 0]) {
@@ -685,7 +651,7 @@ async function bootstrap() {
         }
       }
       
-      // Step 6: Replace obfuscated property names
+      // Replace
       if (decodedMap.size > 0) {
         traverse(ast, {
           StringLiteral(path) {
@@ -694,7 +660,6 @@ async function bootstrap() {
               const decoded = decodedMap.get(value);
               const parent = path.parent;
               
-              // Check if it's being used as a property name
               if (t.isMemberExpression(parent) && parent.property === path.node) {
                 path.replaceWith(t.identifier(decoded));
                 resolved++;
@@ -719,7 +684,7 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
-  // EXISTING PASSES (abbreviated for space - keep your original implementations)
+  // RUNTIME PATTERN PASS
   // ════════════════════════════════════════════════════════════════════════════
 
   const runtimePatternPass = {
@@ -765,8 +730,244 @@ async function bootstrap() {
     },
   };
 
-  // [Keep all your existing passes here - zeroXDecoder, stringArrayCleanup, etc.]
-  // For brevity I'm not repeating them all, but in the actual file you'd keep them.
+  // ════════════════════════════════════════════════════════════════════════════
+  // ZEROX DECODER PASS
+  // ════════════════════════════════════════════════════════════════════════════
+
+  function analyzeDecoderFunction(path2, stringArrays, decoders) {
+    let funcNode, funcName;
+    if (path2.type === 'FunctionDeclaration') { funcNode = path2.node; funcName = funcNode.id?.name; }
+    else if (path2.type === 'VariableDeclarator') { funcNode = path2.node.init; funcName = path2.node.id?.name; }
+    if (!funcName || !/^_0x[a-fA-F0-9]+$/.test(funcName)) return;
+    if (!funcNode?.body) return;
+    const body = funcNode.body.body;
+    if (!body || body.length === 0) return;
+    for (const stmt of body) {
+      if (!t.isReturnStatement(stmt)) continue;
+      const ret = stmt.argument;
+      if (!t.isMemberExpression(ret) || !t.isIdentifier(ret.object) || !stringArrays.has(ret.object.name)) continue;
+      const prop = ret.property; const arrayName = ret.object.name;
+      if (t.isIdentifier(prop)) { decoders.set(funcName, { arrayName, offset: 0, xorKey: null }); return; }
+      if (t.isBinaryExpression(prop)) {
+        const { operator, right } = prop;
+        if (operator === '-' && t.isNumericLiteral(right)) { decoders.set(funcName, { arrayName, offset: right.value, xorKey: null }); return; }
+        if (operator === '+' && t.isNumericLiteral(right)) { decoders.set(funcName, { arrayName, offset: -right.value, xorKey: null }); return; }
+      }
+    }
+  }
+
+  const zeroxDecoderPass = {
+    id: 'zeroXDecoder', name: '_0x Decoder Recovery', priority: 5, enabled: true,
+    run(ast, { log }) {
+      let inlined = 0;
+      const stringArrays = new Map();
+      traverse(ast, {
+        VariableDeclarator(path2) {
+          const { id, init } = path2.node;
+          if (!t.isIdentifier(id) || !t.isArrayExpression(init) || init.elements.length < 2) return;
+          const strings = []; let sc = 0;
+          for (const el of init.elements) { if (t.isStringLiteral(el)) { strings.push(el.value); sc++; } else strings.push(null); }
+          if (sc / init.elements.length >= 0.5 && /^_0x[a-fA-F0-9]+$/.test(id.name)) stringArrays.set(id.name, strings);
+        },
+      });
+      if (stringArrays.size === 0) { log('No _0x string arrays found'); return; }
+      log('Found ' + stringArrays.size + ' string array(s): ' + [...stringArrays.keys()].join(', '));
+      
+      traverse(ast, {
+        ExpressionStatement(path2) {
+          const expr = path2.node.expression;
+          if (!t.isCallExpression(expr)) return;
+          let calleeFunc = null, args = expr.arguments;
+          if (t.isFunctionExpression(expr.callee) && args.length === 2) calleeFunc = expr.callee;
+          if (!calleeFunc) return;
+          const arrayArg = args[0], countArg = args[1];
+          if (!t.isIdentifier(arrayArg) || !stringArrays.has(arrayArg.name) || !t.isNumericLiteral(countArg)) return;
+          const arr = [...stringArrays.get(arrayArg.name)];
+          const rotations = countArg.value % arr.length;
+          for (let i = 0; i < rotations; i++) arr.push(arr.shift());
+          stringArrays.set(arrayArg.name, arr);
+          log('Simulated rotation of ' + arrayArg.name + ' by ' + rotations + ' steps');
+          path2.remove();
+        },
+      });
+      
+      const decoders = new Map();
+      traverse(ast, {
+        FunctionDeclaration(path2) { analyzeDecoderFunction(path2, stringArrays, decoders); },
+        VariableDeclarator(path2) {
+          if (t.isFunctionExpression(path2.node.init) || t.isArrowFunctionExpression(path2.node.init))
+            analyzeDecoderFunction(path2, stringArrays, decoders);
+        },
+      });
+      if (decoders.size > 0) log('Found ' + decoders.size + ' decoder function(s): ' + [...decoders.keys()].join(', '));
+      
+      const decoderNamesToRemove = new Set(decoders.keys());
+      const arrayNamesToRemove = new Set(stringArrays.keys());
+      
+      traverse(ast, {
+        CallExpression(path2) {
+          if (!t.isIdentifier(path2.node.callee)) return;
+          const fnName = path2.node.callee.name;
+          if (!decoders.has(fnName)) return;
+          const { arrayName, offset, xorKey } = decoders.get(fnName);
+          const arr = stringArrays.get(arrayName);
+          if (!arr) return;
+          const indexArg = path2.node.arguments[0];
+          const idxValue = resolveNumericArg(indexArg);
+          if (idxValue === null) return;
+          let idx = idxValue - offset;
+          if (idx < 0 || idx >= arr.length) return;
+          let str = arr[idx];
+          if (str === null) return;
+          if (xorKey && path2.node.arguments[1]) {
+            const xargRaw = path2.node.arguments[1];
+            if (t.isStringLiteral(xargRaw)) str = xorStrings(str, xargRaw.value);
+          }
+          path2.replaceWith(t.stringLiteral(str));
+          inlined++;
+        },
+      });
+      
+      if (inlined > 0) {
+        traverse(ast, {
+          VariableDeclaration(path2) {
+            path2.node.declarations = path2.node.declarations.filter(d => !t.isIdentifier(d.id) || (!arrayNamesToRemove.has(d.id.name) && !decoderNamesToRemove.has(d.id.name)));
+            if (path2.node.declarations.length === 0) path2.remove();
+          },
+          FunctionDeclaration(path2) {
+            if (t.isIdentifier(path2.node.id) && decoderNamesToRemove.has(path2.node.id.name)) path2.remove();
+          },
+        });
+      }
+      log('Inlined ' + inlined + ' _0x decoder call(s)');
+    },
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // SANDOX DECODER PASS
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const sandboxDecoderPass = {
+    id: 'sandboxDecoder', name: 'Sandboxed Decoder Evaluation (RC4/Base64/Shuffle-aware)', priority: 5.5, enabled: true,
+    run(ast, { log }) {
+      const program = ast.program;
+      const HEX_NAME = /^_0x[a-f0-9]+$/i;
+      const topLevelSrcParts = [];
+      const candidateNames = new Set();
+
+      for (const stmt of program.body) {
+        let matched = false;
+        if (t.isFunctionDeclaration(stmt) && stmt.id && HEX_NAME.test(stmt.id.name)) {
+          candidateNames.add(stmt.id.name); matched = true;
+        } else if (t.isVariableDeclaration(stmt)) {
+          for (const d of stmt.declarations) {
+            if (t.isIdentifier(d.id) && HEX_NAME.test(d.id.name) &&
+                (t.isFunctionExpression(d.init) || t.isArrowFunctionExpression(d.init) || t.isObjectExpression(d.init) || t.isArrayExpression(d.init) || t.isCallExpression(d.init))) {
+              candidateNames.add(d.id.name); matched = true;
+            }
+          }
+        } else if (t.isExpressionStatement(stmt) && t.isCallExpression(stmt.expression) &&
+                   (t.isFunctionExpression(stmt.expression.callee) || t.isArrowFunctionExpression(stmt.expression.callee))) {
+          matched = true;
+        }
+        if (matched) {
+          try { topLevelSrcParts.push(generate(stmt, { compact: false }).code); } catch(_) {}
+        }
+      }
+
+      const seen = new Set(candidateNames);
+      traverse(ast, {
+        FunctionDeclaration(path2) {
+          if (path2.parentPath.isProgram()) return;
+          const name = path2.node.id?.name;
+          if (!name || !HEX_NAME.test(name) || seen.has(name)) return;
+          seen.add(name); candidateNames.add(name);
+          try { topLevelSrcParts.push(generate(path2.node, { compact: false }).code); } catch(_) {}
+        },
+      });
+      if (candidateNames.size === 0) { log('No sandboxable decoder machinery found'); return; }
+
+      const preamble = topLevelSrcParts.join('\n');
+      let bindings = null;
+      try {
+        const exposeExpr = '({' + [...candidateNames].map(n => `${JSON.stringify(n)}: (typeof ${n} !== 'undefined' ? ${n} : undefined)`).join(',') + '})';
+        const factory = new Function(preamble + '\nreturn ' + exposeExpr + ';');
+        bindings = factory();
+      } catch (err) { log('Sandbox setup failed: ' + err.message); return; }
+      if (!bindings) { log('Sandbox produced no bindings'); return; }
+
+      function resolveCallable(calleeNode) {
+        if (t.isIdentifier(calleeNode)) {
+          const fn = bindings[calleeNode.name];
+          return typeof fn === 'function' ? fn : null;
+        }
+        if (t.isMemberExpression(calleeNode) && !calleeNode.computed && t.isIdentifier(calleeNode.object) && t.isIdentifier(calleeNode.property)) {
+          const obj = bindings[calleeNode.object.name];
+          if (obj && typeof obj === 'object') {
+            const fn = obj[calleeNode.property.name];
+            return typeof fn === 'function' ? fn : null;
+          }
+        }
+        return null;
+      }
+
+      let inlined = 0, attempted = 0, budget = 20000;
+      const cache = new Map();
+      traverse(ast, {
+        CallExpression(path2) {
+          if (budget <= 0) return;
+          const node = path2.node;
+          const isCandidateCallee =
+            (t.isIdentifier(node.callee) && candidateNames.has(node.callee.name)) ||
+            (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.object) && candidateNames.has(node.callee.object.name));
+          if (!isCandidateCallee) return;
+          const fn = resolveCallable(node.callee);
+          if (!fn) return;
+          const args = [];
+          for (const argNode of node.arguments) {
+            const r = literalArgToJS(argNode);
+            if (!r.ok) return;
+            args.push(r.value);
+          }
+          const cacheKey = (t.isIdentifier(node.callee) ? node.callee.name : node.callee.object.name + '.' + node.callee.property.name) + '(' + JSON.stringify(args) + ')';
+          let result;
+          if (cache.has(cacheKey)) { result = cache.get(cacheKey); }
+          else {
+            attempted++; budget--;
+            try { result = fn(...args); } catch (_) { return; }
+            cache.set(cacheKey, result);
+          }
+          if (typeof result === 'string' || typeof result === 'number' || typeof result === 'boolean') {
+            path2.replaceWith(t.valueToNode(result));
+            inlined++;
+          }
+        },
+      });
+
+      if (inlined > 0) {
+        traverse(ast, { Program(path2) { path2.scope.crawl(); } });
+        traverse(ast, {
+          FunctionDeclaration(path2) {
+            const name = path2.node.id?.name;
+            if (name && candidateNames.has(name)) {
+              const b = path2.scope.getBinding(name);
+              if (b && b.references === 0) path2.remove();
+            }
+          },
+          VariableDeclarator(path2) {
+            if (t.isIdentifier(path2.node.id) && candidateNames.has(path2.node.id.name)) {
+              const b = path2.scope.getBinding(path2.node.id.name);
+              if (b && b.references === 0) {
+                if (path2.parentPath.node.declarations.length === 1) path2.parentPath.remove();
+                else path2.remove();
+              }
+            }
+          },
+        });
+      }
+      log('Executed sandboxed decoder machinery: ' + attempted + ' unique call(s) evaluated, ' + inlined + ' call site(s) inlined');
+    },
+  };
 
   // ════════════════════════════════════════════════════════════════════════════
   // REGISTER ALL PASSES
@@ -774,15 +975,15 @@ async function bootstrap() {
 
   const reg = new TransformRegistry();
   reg.registerAll([
-    // NEW PASSES - run early
     universalDecoderPass,
     infiniteLoopRemovalPass,
     propertyNameDeobfuscationPass,
-    
-    // Existing passes
     runtimePatternPass,
-    // ... all your other passes here
+    zeroxDecoderPass,
+    sandboxDecoderPass,
+    // Add your other passes here...
   ]);
+  
   registry = reg;
   pipelineReady = true;
 
@@ -861,8 +1062,21 @@ async function bootstrap() {
       const result = await runPipeline(code, options, passes, ({ progress, label }) => {
         self.postMessage({ type: 'PROGRESS', progress, label });
       }, controller.signal);
-      if (result.stats?.ast) result.stats.ast = null; // Don't send AST back
+      if (result.stats?.ast) result.stats.ast = null;
       self.postMessage({ type: 'RESULT', ...result });
     } catch(err) {
       if (err.name === 'AbortError') self.postMessage({ type: 'ABORTED' });
-      else self.postMessage({
+      else self.postMessage({ type: 'ERROR', message: err.message ?? String(err) });
+    }
+  });
+
+  if (pendingRun) { self.dispatchEvent(new MessageEvent('message', { data: pendingRun })); pendingRun = null; }
+}
+
+self.addEventListener('message', (event) => {
+  if (!pipelineReady && event.data?.type === 'RUN') pendingRun = event.data;
+}, { once: false });
+
+bootstrap().catch(err => {
+  self.postMessage({ type: 'ERROR', message: 'Worker bootstrap failed: ' + err.message });
+});
