@@ -26,27 +26,6 @@ async function bootstrap() {
   const traverse = traverseMod.default ?? traverseMod;
   const t = tMod;
 
-  // ── ASTCache ───────────────────────────────────────────────────────────────
-  const MAX_CACHE = 32;
-  class ASTCache {
-    constructor() { this._cache = new Map(); }
-    _hash(str) {
-      let h = 0x811c9dc5;
-      for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
-      return h.toString(36);
-    }
-    get(code) { const e = this._cache.get(this._hash(code)); if (e) { e.ts = Date.now(); return e.ast; } return null; }
-    set(code, ast) {
-      if (this._cache.size >= MAX_CACHE) {
-        let ok = null, ot = Infinity;
-        for (const [k, v] of this._cache) { if (v.ts < ot) { ok = k; ot = v.ts; } }
-        if (ok) this._cache.delete(ok);
-      }
-      this._cache.set(this._hash(code), { ast, ts: Date.now() });
-    }
-  }
-  const _cache = new ASTCache();
-
   // ── TransformRegistry ──────────────────────────────────────────────────────
   class TransformRegistry {
     constructor() { this._passes = new Map(); this._enabled = new Map(); }
@@ -62,203 +41,123 @@ async function bootstrap() {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // UTILITY FUNCTIONS
+  // MAIN DEOBFUSCATION PASS - Executes the decoder in a sandbox
   // ════════════════════════════════════════════════════════════════════════════
 
-  const PARSE_OPTS_INNER = { sourceType: 'unambiguous', allowReturnOutsideFunction: true, errorRecovery: true, plugins: ['jsx','typescript','classProperties','dynamicImport'] };
-
-  function isEvalCallee(callee) {
-    if (t.isIdentifier(callee, { name: 'eval' })) return true;
-    if (t.isSequenceExpression(callee) && callee.expressions.length === 2 && t.isIdentifier(callee.expressions[1], { name: 'eval' })) return true;
-    if (t.isMemberExpression(callee) && t.isIdentifier(callee.property, { name: 'eval' })) return true;
-    return false;
-  }
-
-  function safeParseBlock(code) {
-    try { const inner = parse(code, PARSE_OPTS_INNER); return t.blockStatement(inner.program.body); } catch(_) { return null; }
-  }
-
-  function tryInlineEval(path, code) {
-    try {
-      const inner = parse(code, PARSE_OPTS_INNER);
-      const stmts = inner.program.body;
-      if (stmts.length === 0) { if (path.parentPath.isExpressionStatement()) path.parentPath.remove(); else path.replaceWith(t.identifier('undefined')); return true; }
-      if (path.parentPath.isExpressionStatement()) { path.parentPath.replaceWithMultiple(stmts); return true; }
-      path.replaceWith(t.callExpression(t.arrowFunctionExpression([], t.blockStatement(stmts)), []));
-      return true;
-    } catch(_) { return false; }
-  }
-
-  function annotateNode(node, text) {
-    if (!node.leadingComments) node.leadingComments = [];
-    node.leadingComments.push({ type: 'CommentLine', value: ' [Deobfuscator-X] ' + text });
-  }
-
-  function isPrintable(str) {
-    for (let i = 0; i < str.length; i++) { const c = str.charCodeAt(i); if (c < 9 || (c > 10 && c < 32)) return false; }
-    return true;
-  }
-
-  function xorStrings(str, key) {
-    let r = '';
-    for (let i = 0; i < str.length; i++) r += String.fromCharCode(str.charCodeAt(i) ^ key.charCodeAt(i % key.length));
-    return r;
-  }
-
-  function resolveNumericArg(node) {
-    if (t.isNumericLiteral(node)) return node.value;
-    if (t.isStringLiteral(node)) {
-      const v = node.value.trim();
-      const n = /^0[xX][0-9a-fA-F]+$/.test(v) ? parseInt(v, 16) : Number(v);
-      return Number.isFinite(n) ? n : null;
-    }
-    if (t.isUnaryExpression(node) && node.operator === '-') {
-      const inner = resolveNumericArg(node.argument);
-      return inner === null ? null : -inner;
-    }
-    return null;
-  }
-
-  function literalArgToJS(node) {
-    if (t.isStringLiteral(node)) return { ok: true, value: node.value };
-    if (t.isNumericLiteral(node)) return { ok: true, value: node.value };
-    if (t.isBooleanLiteral(node)) return { ok: true, value: node.value };
-    if (t.isNullLiteral(node)) return { ok: true, value: null };
-    if (t.isUnaryExpression(node) && node.operator === '-') {
-      const inner = literalArgToJS(node.argument);
-      return inner.ok ? { ok: true, value: -inner.value } : { ok: false };
-    }
-    if (t.isBinaryExpression(node) && (node.operator === '+' || node.operator === '-')) {
-      const l = literalArgToJS(node.left), r = literalArgToJS(node.right);
-      if (l.ok && r.ok) return { ok: true, value: node.operator === '+' ? l.value + r.value : l.value - r.value };
-    }
-    return { ok: false };
-  }
-
-  function resolveIndex(property, computed) {
-    if (!computed) return null;
-    if (t.isNumericLiteral(property)) return property.value;
-    if (t.isStringLiteral(property)) { const n = parseInt(property.value, 10); return isNaN(n) ? null : n; }
-    if (t.isBinaryExpression(property)) {
-      const { operator, left, right } = property;
-      if (t.isNumericLiteral(left) && t.isNumericLiteral(right)) {
-        if (operator === '+') return left.value + right.value;
-        if (operator === '-') return left.value - right.value;
-      }
-    }
-    return null;
-  }
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // PASS 1: UNIVERSAL DECODER 
-  // ════════════════════════════════════════════════════════════════════════════
-
-  const universalDecoderPass = {
-    id: 'universalDecoder', 
-    name: 'Universal _0x4684 Decoder (Runtime Execution)', 
-    priority: 4.5, 
+  const runtimeDecoderPass = {
+    id: 'runtimeDecoder',
+    name: 'Runtime Decoder Execution',
+    priority: 1,
     enabled: true,
     run(ast, { log }) {
-      let inlined = 0;
+      let totalInlined = 0;
       
-      let arrayFunctionName = null;
-      let stringArray = [];
+      // Step 1: Extract all _0x functions and their source code
+      const functionSources = new Map();
+      const functionBodies = new Map();
       
       traverse(ast, {
         FunctionDeclaration(path) {
           const name = path.node.id?.name;
-          if (!name || !/^_0x[a-f0-9]+$/i.test(name)) return;
-          
-          const body = path.node.body;
-          if (!t.isBlockStatement(body)) return;
-          
-          for (const stmt of body.body) {
-            if (t.isReturnStatement(stmt) && t.isArrayExpression(stmt.argument)) {
-              const elements = stmt.argument.elements
-                .filter(el => t.isStringLiteral(el))
-                .map(el => el.value);
-              if (elements.length > 10) {
-                arrayFunctionName = name;
-                stringArray = elements;
-                log('Found string array: ' + name + ' with ' + elements.length + ' entries');
-                return;
-              }
-            }
+          if (name && /^_0x[a-f0-9]+$/i.test(name)) {
+            try {
+              const src = generate(path.node, { compact: false }).code;
+              functionSources.set(name, src);
+              functionBodies.set(name, path.node);
+            } catch(_) {}
+          }
+        },
+        VariableDeclarator(path) {
+          const id = path.node.id;
+          const init = path.node.init;
+          if (t.isIdentifier(id) && /^_0x[a-f0-9]+$/i.test(id.name) && 
+              (t.isFunctionExpression(init) || t.isArrowFunctionExpression(init))) {
+            try {
+              const src = generate(path.node, { compact: false }).code;
+              functionSources.set(id.name, src);
+              functionBodies.set(id.name, init);
+            } catch(_) {}
           }
         }
       });
+      
+      if (functionSources.size === 0) {
+        log('No _0x functions found');
+        return;
+      }
+      
+      log('Found ' + functionSources.size + ' _0x functions');
+      
+      // Step 2: Find the string array function
+      let arrayFunctionName = null;
+      let arrayFunctionSrc = null;
+      let stringArray = [];
+      
+      for (const [name, src] of functionSources) {
+        // Check if this function returns an array of strings
+        try {
+          const fn = new Function('return ' + src + ';')();
+          if (typeof fn === 'function') {
+            const result = fn();
+            if (Array.isArray(result) && result.length > 10 && result.every(s => typeof s === 'string')) {
+              arrayFunctionName = name;
+              arrayFunctionSrc = src;
+              stringArray = result;
+              log('Found string array function: ' + name + ' with ' + result.length + ' entries');
+              break;
+            }
+          }
+        } catch(_) {}
+      }
       
       if (stringArray.length === 0) {
         log('No string array found');
         return;
       }
       
+      // Step 3: Find the decoder function
       let decoderName = null;
-      let decoderOffset = 0;
-      let arrayVarName = null;
+      let decoderSrc = null;
       
-      traverse(ast, {
-        FunctionDeclaration(path) {
-          const name = path.node.id?.name;
-          if (!name || !/^_0x[a-f0-9]+$/i.test(name) || name === arrayFunctionName) return;
-          
-          const body = path.node.body;
-          if (!t.isBlockStatement(body)) return;
-          
-          let foundArrayRef = false;
-          let localArrayName = null;
-          let localOffset = 0;
-          
-          for (const stmt of body.body) {
-            if (t.isVariableDeclaration(stmt)) {
-              for (const decl of stmt.declarations) {
-                if (t.isCallExpression(decl.init) && 
-                    t.isIdentifier(decl.init.callee) && 
-                    decl.init.callee.name === arrayFunctionName) {
-                  foundArrayRef = true;
-                  localArrayName = decl.id.name;
-                }
-              }
-            }
-            
-            if (t.isExpressionStatement(stmt) && 
-                t.isAssignmentExpression(stmt.expression) &&
-                t.isBinaryExpression(stmt.expression.right) &&
-                stmt.expression.right.operator === '-' &&
-                t.isNumericLiteral(stmt.expression.right.right)) {
-              localOffset = stmt.expression.right.right.value;
-            }
-          }
-          
-          if (foundArrayRef && localArrayName) {
-            decoderName = name;
-            arrayVarName = localArrayName;
-            decoderOffset = localOffset;
-            log('Found decoder: ' + name + ' offset=' + localOffset);
-          }
+      for (const [name, src] of functionSources) {
+        if (name === arrayFunctionName) continue;
+        // Check if this function references the array function
+        if (src.includes(arrayFunctionName)) {
+          decoderName = name;
+          decoderSrc = src;
+          log('Found decoder function: ' + name);
+          break;
         }
-      });
+      }
       
-      if (!decoderName || !arrayVarName) {
+      if (!decoderName || !decoderSrc) {
         log('No decoder function found');
         return;
       }
       
+      // Step 4: Build a sandboxed environment with all _0x functions
+      const allFunctions = [];
+      for (const [name, src] of functionSources) {
+        allFunctions.push(src);
+      }
+      
+      const sandboxCode = allFunctions.join('\n');
+      
+      // Step 5: Find all calls to the decoder function and replace them
       const callSites = [];
       traverse(ast, {
         CallExpression(path) {
-          if (!t.isIdentifier(path.node.callee)) return;
-          if (path.node.callee.name !== decoderName) return;
-          
-          const args = path.node.arguments.map(arg => {
-            if (t.isStringLiteral(arg)) return { type: 'string', value: arg.value };
-            if (t.isNumericLiteral(arg)) return { type: 'number', value: arg.value };
-            if (t.isIdentifier(arg)) return { type: 'identifier', name: arg.name };
-            return null;
-          });
-          
-          if (args.length >= 1 && args[0]) {
-            callSites.push({ path, args });
+          const callee = path.node.callee;
+          if (t.isIdentifier(callee) && callee.name === decoderName) {
+            const args = path.node.arguments.map(arg => {
+              if (t.isStringLiteral(arg)) return { type: 'string', value: arg.value };
+              if (t.isNumericLiteral(arg)) return { type: 'number', value: arg.value };
+              if (t.isIdentifier(arg)) return { type: 'identifier', name: arg.name };
+              return null;
+            });
+            if (args.length >= 1 && args[0]) {
+              callSites.push({ path, args });
+            }
           }
         }
       });
@@ -270,29 +169,7 @@ async function bootstrap() {
       
       log('Found ' + callSites.length + ' calls to ' + decoderName);
       
-      let decoderSource = '';
-      let arraySource = '';
-      
-      traverse(ast, {
-        FunctionDeclaration(path) {
-          if (path.node.id?.name === decoderName) {
-            try {
-              decoderSource = generate(path.node, { compact: false }).code;
-            } catch(_) {}
-          }
-          if (path.node.id?.name === arrayFunctionName) {
-            try {
-              arraySource = generate(path.node, { compact: false }).code;
-            } catch(_) {}
-          }
-        }
-      });
-      
-      if (!decoderSource || !arraySource) {
-        log('Failed to extract source code for decoder/array');
-        return;
-      }
-      
+      // Step 6: Evaluate each call site
       let evaluated = 0;
       
       for (const site of callSites) {
@@ -305,22 +182,36 @@ async function bootstrap() {
           } else if (arg0.type === 'number') {
             arg0Value = String(arg0.value);
           } else if (arg0.type === 'identifier') {
+            // Try to resolve the identifier from the scope
             let resolved = false;
-            traverse(ast, {
-              VariableDeclarator(path) {
-                if (t.isIdentifier(path.node.id) && path.node.id.name === arg0.name && path.node.init) {
-                  if (t.isStringLiteral(path.node.init)) {
-                    arg0Value = '"' + path.node.init.value + '"';
-                    resolved = true;
-                  } else if (t.isNumericLiteral(path.node.init)) {
-                    arg0Value = String(path.node.init.value);
-                    resolved = true;
+            const binding = site.path.scope.getBinding(arg0.name);
+            if (binding && binding.path.node.init) {
+              const init = binding.path.node.init;
+              if (t.isStringLiteral(init)) {
+                arg0Value = '"' + init.value + '"';
+                resolved = true;
+              } else if (t.isNumericLiteral(init)) {
+                arg0Value = String(init.value);
+                resolved = true;
+              }
+            }
+            if (!resolved) {
+              // Try to find it in the surrounding code
+              let found = false;
+              traverse(ast, {
+                VariableDeclarator(path) {
+                  if (t.isIdentifier(path.node.id) && path.node.id.name === arg0.name && path.node.init) {
+                    if (t.isStringLiteral(path.node.init)) {
+                      arg0Value = '"' + path.node.init.value + '"';
+                      found = true;
+                    } else if (t.isNumericLiteral(path.node.init)) {
+                      arg0Value = String(path.node.init.value);
+                      found = true;
+                    }
                   }
                 }
-              }
-            });
-            if (!resolved) {
-              continue;
+              });
+              if (!found) continue;
             }
           }
           
@@ -334,10 +225,10 @@ async function bootstrap() {
             arg1Value = ', ""';
           }
           
+          // Build the evaluation code
           const evalCode = `
             (function() {
-              ${arraySource}
-              ${decoderSource}
+              ${sandboxCode}
               return ${decoderName}(${arg0Value}${arg1Value});
             })()
           `;
@@ -352,20 +243,36 @@ async function bootstrap() {
           if (typeof result === 'string' && result.length > 0) {
             let decoded = result;
             
-            if (/^[A-Za-z0-9+/]+={0,2}$/.test(decoded)) {
+            // Try to decode if it's still obfuscated
+            // Check for Base64
+            if (/^[A-Za-z0-9+/]+={0,2}$/.test(decoded) && decoded.length > 4) {
               try {
-                const base64Decoded = atob(decoded);
-                if (isPrintable(base64Decoded) && base64Decoded.length > 0) {
-                  decoded = base64Decoded;
+                const b64 = atob(decoded);
+                if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(b64) || b64.includes(' ') || b64.includes('.')) {
+                  decoded = b64;
                 }
               } catch(_) {}
             }
             
+            // Check for hex
+            if (/^[0-9a-fA-F]{4,}$/.test(decoded) && decoded.length % 2 === 0) {
+              try {
+                let hex = '';
+                for (let i = 0; i < decoded.length; i += 2) {
+                  hex += String.fromCharCode(parseInt(decoded.substr(i, 2), 16));
+                }
+                if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(hex) || hex.includes(' ')) {
+                  decoded = hex;
+                }
+              } catch(_) {}
+            }
+            
+            // Check for URL encoding
             if (decoded.includes('%')) {
               try {
-                const urlDecoded = decodeURIComponent(decoded);
-                if (isPrintable(urlDecoded) && urlDecoded.length > 0) {
-                  decoded = urlDecoded;
+                const url = decodeURIComponent(decoded);
+                if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(url) || url.includes(' ')) {
+                  decoded = url;
                 }
               } catch(_) {}
             }
@@ -378,9 +285,11 @@ async function bootstrap() {
         }
       }
       
-      inlined = evaluated;
+      totalInlined = evaluated;
       
-      if (inlined > 0) {
+      // Step 7: Remove unused functions
+      if (totalInlined > 0) {
+        // Check if array function is still referenced
         let arrayRefs = 0;
         traverse(ast, {
           Identifier(path) {
@@ -395,12 +304,22 @@ async function bootstrap() {
             FunctionDeclaration(path) {
               if (path.node.id?.name === arrayFunctionName) {
                 path.remove();
-                log('Removed unused array function: ' + arrayFunctionName);
+              }
+            },
+            VariableDeclarator(path) {
+              if (t.isIdentifier(path.node.id) && path.node.id.name === arrayFunctionName) {
+                if (path.parentPath.node.declarations.length === 1) {
+                  path.parentPath.remove();
+                } else {
+                  path.remove();
+                }
               }
             }
           });
+          log('Removed unused array function: ' + arrayFunctionName);
         }
         
+        // Check if decoder function is still referenced
         let decoderRefs = 0;
         traverse(ast, {
           Identifier(path) {
@@ -415,13 +334,53 @@ async function bootstrap() {
             FunctionDeclaration(path) {
               if (path.node.id?.name === decoderName) {
                 path.remove();
-                log('Removed unused decoder function: ' + decoderName);
+              }
+            },
+            VariableDeclarator(path) {
+              if (t.isIdentifier(path.node.id) && path.node.id.name === decoderName) {
+                if (path.parentPath.node.declarations.length === 1) {
+                  path.parentPath.remove();
+                } else {
+                  path.remove();
+                }
               }
             }
           });
+          log('Removed unused decoder function: ' + decoderName);
         }
         
-        log('Inlined ' + inlined + ' decoder calls');
+        // Remove other unused _0x functions
+        const usedNames = new Set();
+        traverse(ast, {
+          Identifier(path) {
+            if (/^_0x[a-f0-9]+$/i.test(path.node.name)) {
+              usedNames.add(path.node.name);
+            }
+          }
+        });
+        
+        for (const [name] of functionSources) {
+          if (!usedNames.has(name) && name !== arrayFunctionName && name !== decoderName) {
+            traverse(ast, {
+              FunctionDeclaration(path) {
+                if (path.node.id?.name === name) {
+                  path.remove();
+                }
+              },
+              VariableDeclarator(path) {
+                if (t.isIdentifier(path.node.id) && path.node.id.name === name) {
+                  if (path.parentPath.node.declarations.length === 1) {
+                    path.parentPath.remove();
+                  } else {
+                    path.remove();
+                  }
+                }
+              }
+            });
+          }
+        }
+        
+        log('Inlined ' + totalInlined + ' decoder calls');
       } else {
         log('Failed to evaluate any decoder calls');
       }
@@ -429,13 +388,13 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
-  // PASS 2: INFINITE LOOP REMOVAL
+  // INFINITE LOOP REMOVAL
   // ════════════════════════════════════════════════════════════════════════════
 
   const infiniteLoopRemovalPass = {
-    id: 'infiniteLoopRemoval', 
-    name: 'Infinite Loop Removal (while(true))', 
-    priority: 23, 
+    id: 'infiniteLoopRemoval',
+    name: 'Infinite Loop Removal',
+    priority: 2,
     enabled: true,
     run(ast, { log }) {
       let removed = 0;
@@ -451,20 +410,44 @@ async function bootstrap() {
           const body = path.node.body;
           if (!t.isBlockStatement(body)) return;
           
-          const hasEffect = body.body.some(stmt => {
-            if (t.isDebuggerStatement(stmt)) return false;
+          // Check if the body has any effect
+          let hasEffect = false;
+          for (const stmt of body.body) {
+            if (t.isDebuggerStatement(stmt)) continue;
             if (t.isExpressionStatement(stmt) && 
                 t.isCallExpression(stmt.expression) &&
-                t.isIdentifier(stmt.expression.callee, { name: 'debugger' })) return false;
-            return true;
-          });
+                t.isIdentifier(stmt.expression.callee, { name: 'debugger' })) continue;
+            // Check if it's just a try/catch with no effect
+            if (t.isTryStatement(stmt)) {
+              // Check if the try block just has array push/shift
+              let isShuffle = true;
+              for (const s of stmt.block.body) {
+                if (!t.isExpressionStatement(s) || !t.isCallExpression(s.expression)) {
+                  isShuffle = false;
+                  break;
+                }
+                const callee = s.expression.callee;
+                if (!t.isMemberExpression(callee) || 
+                    !t.isIdentifier(callee.object) ||
+                    !t.isIdentifier(callee.property) ||
+                    (callee.property.name !== 'push' && callee.property.name !== 'shift')) {
+                  isShuffle = false;
+                  break;
+                }
+              }
+              if (isShuffle) continue;
+            }
+            hasEffect = true;
+            break;
+          }
           
-          if (hasEffect) return;
-          
-          path.remove();
-          removed++;
+          if (!hasEffect) {
+            path.remove();
+            removed++;
+          }
         },
         
+        // Remove IIFE with while(true)
         CallExpression(path) {
           const callee = path.node.callee;
           if (!t.isFunctionExpression(callee) && !t.isArrowFunctionExpression(callee)) return;
@@ -473,17 +456,48 @@ async function bootstrap() {
           if (!t.isBlockStatement(body)) return;
           
           let hasOnlyInfiniteLoop = true;
-          
           for (const stmt of body.body) {
             if (t.isWhileStatement(stmt)) {
               const test = stmt.test;
               const isTrue = t.isBooleanLiteral(test, { value: true }) ||
                              t.isNumericLiteral(test, { value: 1 });
-              if (isTrue && t.isBlockStatement(stmt.body) && stmt.body.body.length === 0) {
-                continue;
+              if (isTrue) {
+                // Check if the while body is just array shuffle
+                const wbody = stmt.body;
+                if (t.isBlockStatement(wbody)) {
+                  let isShuffle = true;
+                  for (const s of wbody.body) {
+                    if (!t.isTryStatement(s)) {
+                      isShuffle = false;
+                      break;
+                    }
+                    // Check try block for array push/shift
+                    let hasPush = false;
+                    for (const ts of s.block.body) {
+                      if (t.isExpressionStatement(ts) && t.isCallExpression(ts.expression)) {
+                        const callee2 = ts.expression.callee;
+                        if (t.isMemberExpression(callee2) && 
+                            t.isIdentifier(callee2.property) &&
+                            (callee2.property.name === 'push' || callee2.property.name === 'shift')) {
+                          hasPush = true;
+                        }
+                      }
+                    }
+                    if (!hasPush) {
+                      isShuffle = false;
+                      break;
+                    }
+                  }
+                  if (isShuffle) continue;
+                }
+                hasOnlyInfiniteLoop = false;
+                break;
               }
             }
-            hasOnlyInfiniteLoop = false;
+            if (!t.isEmptyStatement(stmt) && !t.isDebuggerStatement(stmt)) {
+              hasOnlyInfiniteLoop = false;
+              break;
+            }
           }
           
           if (hasOnlyInfiniteLoop) {
@@ -495,529 +509,8 @@ async function bootstrap() {
       
       if (removed > 0) {
         log('Removed ' + removed + ' infinite loop(s)');
-      } else {
-        log('No infinite loops found');
       }
     }
-  };
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // PASS 3: PROPERTY NAME DEOBFUSCATION
-  // ════════════════════════════════════════════════════════════════════════════
-
-  const propertyNameDeobfuscationPass = {
-    id: 'propertyNameDeobfuscation',
-    name: 'Property Name Deobfuscation',
-    priority: 7,
-    enabled: true,
-    run(ast, { log }) {
-      let resolved = 0;
-      const decodedMap = new Map();
-      
-      let arrayFunctionName = null;
-      
-      traverse(ast, {
-        FunctionDeclaration(path) {
-          const name = path.node.id?.name;
-          if (!name || !/^_0x[a-f0-9]+$/i.test(name)) return;
-          
-          const body = path.node.body;
-          if (!t.isBlockStatement(body)) return;
-          
-          for (const stmt of body.body) {
-            if (t.isReturnStatement(stmt) && t.isArrayExpression(stmt.argument)) {
-              const elements = stmt.argument.elements
-                .filter(el => t.isStringLiteral(el))
-                .map(el => el.value);
-              if (elements.length > 10) {
-                arrayFunctionName = name;
-                log('Found property name array: ' + name + ' with ' + elements.length + ' entries');
-                break;
-              }
-            }
-          }
-        }
-      });
-      
-      if (!arrayFunctionName) {
-        log('No property name array found');
-        return;
-      }
-      
-      let decoderName = null;
-      let decoderOffset = 0;
-      
-      traverse(ast, {
-        FunctionDeclaration(path) {
-          const name = path.node.id?.name;
-          if (!name || !/^_0x[a-f0-9]+$/i.test(name) || name === arrayFunctionName) return;
-          
-          const body = path.node.body;
-          if (!t.isBlockStatement(body)) return;
-          
-          let foundOffset = 0;
-          let foundArrayRef = false;
-          
-          for (const stmt of body.body) {
-            if (t.isExpressionStatement(stmt) && 
-                t.isAssignmentExpression(stmt.expression) &&
-                t.isBinaryExpression(stmt.expression.right) &&
-                stmt.expression.right.operator === '-') {
-              const right = stmt.expression.right;
-              if (t.isIdentifier(right.left) && t.isNumericLiteral(right.right)) {
-                foundOffset = right.right.value;
-              }
-            }
-            
-            if (t.isVariableDeclaration(stmt)) {
-              for (const decl of stmt.declarations) {
-                if (t.isCallExpression(decl.init) && 
-                    t.isIdentifier(decl.init.callee) && 
-                    decl.init.callee.name === arrayFunctionName) {
-                  foundArrayRef = true;
-                }
-              }
-            }
-          }
-          
-          if (foundArrayRef && foundOffset > 0) {
-            decoderName = name;
-            decoderOffset = foundOffset;
-            log('Found property decoder: ' + name + ' offset=' + foundOffset);
-          }
-        }
-      });
-      
-      if (!decoderName) {
-        log('No property decoder found');
-        return;
-      }
-      
-      let decoderSource = '';
-      let arraySource = '';
-      
-      traverse(ast, {
-        FunctionDeclaration(path) {
-          if (path.node.id?.name === decoderName) {
-            try {
-              decoderSource = generate(path.node, { compact: false }).code;
-            } catch(_) {}
-          }
-          if (path.node.id?.name === arrayFunctionName) {
-            try {
-              arraySource = generate(path.node, { compact: false }).code;
-            } catch(_) {}
-          }
-        }
-      });
-      
-      const obfuscatedStrings = new Set();
-      traverse(ast, {
-        StringLiteral(path) {
-          const value = path.node.value;
-          if (/^[A-Za-z0-9]{10,20}$/.test(value) && !decodedMap.has(value)) {
-            obfuscatedStrings.add(value);
-          }
-        }
-      });
-      
-      for (const str of obfuscatedStrings) {
-        try {
-          for (const offset of [decoderOffset, decoderOffset - 1, decoderOffset + 1, 108, 0]) {
-            const evalCode = `
-              (function() {
-                ${arraySource}
-                ${decoderSource}
-                const idx = parseInt("${str}", 16) - ${offset};
-                const arr = ${arrayFunctionName}();
-                return arr[idx] || '';
-              })()
-            `;
-            
-            try {
-              const result = new Function('return ' + evalCode)();
-              if (typeof result === 'string' && result.length > 0 && result !== str) {
-                if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(result)) {
-                  decodedMap.set(str, result);
-                  log('Decoded property: "' + str + '" → "' + result + '"');
-                  break;
-                }
-              }
-            } catch(_) {
-              continue;
-            }
-          }
-        } catch(_) {
-          continue;
-        }
-      }
-      
-      if (decodedMap.size > 0) {
-        traverse(ast, {
-          StringLiteral(path) {
-            const value = path.node.value;
-            if (decodedMap.has(value)) {
-              const decoded = decodedMap.get(value);
-              const parent = path.parent;
-              
-              if (t.isMemberExpression(parent) && parent.property === path.node) {
-                path.replaceWith(t.identifier(decoded));
-                resolved++;
-              } else if (t.isObjectProperty(parent) && parent.key === path.node && !parent.computed) {
-                path.replaceWith(t.identifier(decoded));
-                resolved++;
-              }
-            }
-          }
-        });
-      }
-      
-      if (resolved > 0) {
-        log('Resolved ' + resolved + ' obfuscated property name(s)');
-      } else {
-        log('No property names to resolve');
-      }
-    }
-  };
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // PASS 4: RUNTIME PATTERN PASS
-  // ════════════════════════════════════════════════════════════════════════════
-
-  const runtimePatternPass = {
-    id: 'runtimePatterns', name: 'Runtime Pattern Detection', priority: 3, enabled: true,
-    run(ast, { log }) {
-      let detected = 0, inlined = 0;
-      traverse(ast, {
-        CallExpression(path) {
-          const { callee, arguments: args } = path.node;
-          if (isEvalCallee(callee)) {
-            detected++;
-            if (args.length === 1 && t.isStringLiteral(args[0])) { if (tryInlineEval(path, args[0].value)) { inlined++; return; } }
-            annotateNode(path.node, 'eval() — could not inline statically');
-            return;
-          }
-          if (t.isIdentifier(callee) && (callee.name === 'setTimeout' || callee.name === 'setInterval') && args.length >= 1 && t.isStringLiteral(args[0])) {
-            detected++;
-            const block = safeParseBlock(args[0].value);
-            if (block) { args[0] = t.arrowFunctionExpression([], block); inlined++; }
-            else annotateNode(path.node, callee.name + '(string) — could not parse body');
-          }
-        },
-        NewExpression(path) {
-          if (!t.isIdentifier(path.node.callee, { name: 'Function' })) return;
-          const args = path.node.arguments;
-          if (args.length === 0) return;
-          detected++;
-          const bodyArg = args[args.length - 1];
-          if (t.isStringLiteral(bodyArg)) {
-            const block = safeParseBlock(bodyArg.value);
-            if (block) {
-              const paramIds = args.slice(0,-1).filter(a => t.isStringLiteral(a)).flatMap(a => a.value.split(',').map(s=>s.trim()).filter(Boolean)).map(n => t.identifier(n));
-              path.replaceWith(t.functionExpression(null, paramIds, block));
-              inlined++;
-              return;
-            }
-          }
-          annotateNode(path.node, 'new Function() — dynamic constructor');
-        },
-      });
-      if (detected > 0) log('Found ' + detected + ' runtime pattern(s), inlined ' + inlined + ' statically');
-      else log('No eval/Function/setTimeout(string) patterns found');
-    },
-  };
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // PASS 5: ZEROX DECODER PASS
-  // ════════════════════════════════════════════════════════════════════════════
-
-  function analyzeDecoderFunction(path2, stringArrays, decoders) {
-    let funcNode, funcName;
-    if (path2.type === 'FunctionDeclaration') { funcNode = path2.node; funcName = funcNode.id?.name; }
-    else if (path2.type === 'VariableDeclarator') { funcNode = path2.node.init; funcName = path2.node.id?.name; }
-    if (!funcName || !/^_0x[a-fA-F0-9]+$/.test(funcName)) return;
-    if (!funcNode?.body) return;
-    const body = funcNode.body.body;
-    if (!body || body.length === 0) return;
-    for (const stmt of body) {
-      if (!t.isReturnStatement(stmt)) continue;
-      const ret = stmt.argument;
-      if (!t.isMemberExpression(ret) || !t.isIdentifier(ret.object) || !stringArrays.has(ret.object.name)) continue;
-      const prop = ret.property; const arrayName = ret.object.name;
-      if (t.isIdentifier(prop)) { decoders.set(funcName, { arrayName, offset: 0, xorKey: null }); return; }
-      if (t.isBinaryExpression(prop)) {
-        const { operator, right } = prop;
-        if (operator === '-' && t.isNumericLiteral(right)) { decoders.set(funcName, { arrayName, offset: right.value, xorKey: null }); return; }
-        if (operator === '+' && t.isNumericLiteral(right)) { decoders.set(funcName, { arrayName, offset: -right.value, xorKey: null }); return; }
-      }
-    }
-  }
-
-  const zeroxDecoderPass = {
-    id: 'zeroXDecoder', name: '_0x Decoder Recovery', priority: 5, enabled: true,
-    run(ast, { log }) {
-      let inlined = 0;
-      const stringArrays = new Map();
-      traverse(ast, {
-        VariableDeclarator(path2) {
-          const { id, init } = path2.node;
-          if (!t.isIdentifier(id) || !t.isArrayExpression(init) || init.elements.length < 2) return;
-          const strings = []; let sc = 0;
-          for (const el of init.elements) { if (t.isStringLiteral(el)) { strings.push(el.value); sc++; } else strings.push(null); }
-          if (sc / init.elements.length >= 0.5 && /^_0x[a-fA-F0-9]+$/.test(id.name)) stringArrays.set(id.name, strings);
-        },
-      });
-      if (stringArrays.size === 0) { log('No _0x string arrays found'); return; }
-      log('Found ' + stringArrays.size + ' string array(s): ' + [...stringArrays.keys()].join(', '));
-      
-      traverse(ast, {
-        ExpressionStatement(path2) {
-          const expr = path2.node.expression;
-          if (!t.isCallExpression(expr)) return;
-          let calleeFunc = null, args = expr.arguments;
-          if (t.isFunctionExpression(expr.callee) && args.length === 2) calleeFunc = expr.callee;
-          if (!calleeFunc) return;
-          const arrayArg = args[0], countArg = args[1];
-          if (!t.isIdentifier(arrayArg) || !stringArrays.has(arrayArg.name) || !t.isNumericLiteral(countArg)) return;
-          const arr = [...stringArrays.get(arrayArg.name)];
-          const rotations = countArg.value % arr.length;
-          for (let i = 0; i < rotations; i++) arr.push(arr.shift());
-          stringArrays.set(arrayArg.name, arr);
-          log('Simulated rotation of ' + arrayArg.name + ' by ' + rotations + ' steps');
-          path2.remove();
-        },
-      });
-      
-      const decoders = new Map();
-      traverse(ast, {
-        FunctionDeclaration(path2) { analyzeDecoderFunction(path2, stringArrays, decoders); },
-        VariableDeclarator(path2) {
-          if (t.isFunctionExpression(path2.node.init) || t.isArrowFunctionExpression(path2.node.init))
-            analyzeDecoderFunction(path2, stringArrays, decoders);
-        },
-      });
-      if (decoders.size > 0) log('Found ' + decoders.size + ' decoder function(s): ' + [...decoders.keys()].join(', '));
-      
-      const decoderNamesToRemove = new Set(decoders.keys());
-      const arrayNamesToRemove = new Set(stringArrays.keys());
-      
-      traverse(ast, {
-        CallExpression(path2) {
-          if (!t.isIdentifier(path2.node.callee)) return;
-          const fnName = path2.node.callee.name;
-          if (!decoders.has(fnName)) return;
-          const { arrayName, offset, xorKey } = decoders.get(fnName);
-          const arr = stringArrays.get(arrayName);
-          if (!arr) return;
-          const indexArg = path2.node.arguments[0];
-          const idxValue = resolveNumericArg(indexArg);
-          if (idxValue === null) return;
-          let idx = idxValue - offset;
-          if (idx < 0 || idx >= arr.length) return;
-          let str = arr[idx];
-          if (str === null) return;
-          if (xorKey && path2.node.arguments[1]) {
-            const xargRaw = path2.node.arguments[1];
-            if (t.isStringLiteral(xargRaw)) str = xorStrings(str, xargRaw.value);
-          }
-          path2.replaceWith(t.stringLiteral(str));
-          inlined++;
-        },
-      });
-      
-      if (inlined > 0) {
-        traverse(ast, {
-          VariableDeclaration(path2) {
-            path2.node.declarations = path2.node.declarations.filter(d => !t.isIdentifier(d.id) || (!arrayNamesToRemove.has(d.id.name) && !decoderNamesToRemove.has(d.id.name)));
-            if (path2.node.declarations.length === 0) path2.remove();
-          },
-          FunctionDeclaration(path2) {
-            if (t.isIdentifier(path2.node.id) && decoderNamesToRemove.has(path2.node.id.name)) path2.remove();
-          },
-        });
-      }
-      log('Inlined ' + inlined + ' _0x decoder call(s)');
-    },
-  };
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // PASS 6: SANDOX DECODER PASS
-  // ════════════════════════════════════════════════════════════════════════════
-
-  const sandboxDecoderPass = {
-    id: 'sandboxDecoder', name: 'Sandboxed Decoder Evaluation (RC4/Base64/Shuffle-aware)', priority: 5.5, enabled: true,
-    run(ast, { log }) {
-      const program = ast.program;
-      const HEX_NAME = /^_0x[a-f0-9]+$/i;
-      const topLevelSrcParts = [];
-      const candidateNames = new Set();
-
-      for (const stmt of program.body) {
-        let matched = false;
-        if (t.isFunctionDeclaration(stmt) && stmt.id && HEX_NAME.test(stmt.id.name)) {
-          candidateNames.add(stmt.id.name); matched = true;
-        } else if (t.isVariableDeclaration(stmt)) {
-          for (const d of stmt.declarations) {
-            if (t.isIdentifier(d.id) && HEX_NAME.test(d.id.name) &&
-                (t.isFunctionExpression(d.init) || t.isArrowFunctionExpression(d.init) || t.isObjectExpression(d.init) || t.isArrayExpression(d.init) || t.isCallExpression(d.init))) {
-              candidateNames.add(d.id.name); matched = true;
-            }
-          }
-        } else if (t.isExpressionStatement(stmt) && t.isCallExpression(stmt.expression) &&
-                   (t.isFunctionExpression(stmt.expression.callee) || t.isArrowFunctionExpression(stmt.expression.callee))) {
-          matched = true;
-        }
-        if (matched) {
-          try { topLevelSrcParts.push(generate(stmt, { compact: false }).code); } catch(_) {}
-        }
-      }
-
-      const seen = new Set(candidateNames);
-      traverse(ast, {
-        FunctionDeclaration(path2) {
-          if (path2.parentPath.isProgram()) return;
-          const name = path2.node.id?.name;
-          if (!name || !HEX_NAME.test(name) || seen.has(name)) return;
-          seen.add(name); candidateNames.add(name);
-          try { topLevelSrcParts.push(generate(path2.node, { compact: false }).code); } catch(_) {}
-        },
-      });
-      if (candidateNames.size === 0) { log('No sandboxable decoder machinery found'); return; }
-
-      const preamble = topLevelSrcParts.join('\n');
-      let bindings = null;
-      try {
-        const exposeExpr = '({' + [...candidateNames].map(n => `${JSON.stringify(n)}: (typeof ${n} !== 'undefined' ? ${n} : undefined)`).join(',') + '})';
-        const factory = new Function(preamble + '\nreturn ' + exposeExpr + ';');
-        bindings = factory();
-      } catch (err) { log('Sandbox setup failed: ' + err.message); return; }
-      if (!bindings) { log('Sandbox produced no bindings'); return; }
-
-      function resolveCallable(calleeNode) {
-        if (t.isIdentifier(calleeNode)) {
-          const fn = bindings[calleeNode.name];
-          return typeof fn === 'function' ? fn : null;
-        }
-        if (t.isMemberExpression(calleeNode) && !calleeNode.computed && t.isIdentifier(calleeNode.object) && t.isIdentifier(calleeNode.property)) {
-          const obj = bindings[calleeNode.object.name];
-          if (obj && typeof obj === 'object') {
-            const fn = obj[calleeNode.property.name];
-            return typeof fn === 'function' ? fn : null;
-          }
-        }
-        return null;
-      }
-
-      let inlined = 0, attempted = 0, budget = 20000;
-      const cache = new Map();
-      traverse(ast, {
-        CallExpression(path2) {
-          if (budget <= 0) return;
-          const node = path2.node;
-          const isCandidateCallee =
-            (t.isIdentifier(node.callee) && candidateNames.has(node.callee.name)) ||
-            (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.object) && candidateNames.has(node.callee.object.name));
-          if (!isCandidateCallee) return;
-          const fn = resolveCallable(node.callee);
-          if (!fn) return;
-          const args = [];
-          for (const argNode of node.arguments) {
-            const r = literalArgToJS(argNode);
-            if (!r.ok) return;
-            args.push(r.value);
-          }
-          const cacheKey = (t.isIdentifier(node.callee) ? node.callee.name : node.callee.object.name + '.' + node.callee.property.name) + '(' + JSON.stringify(args) + ')';
-          let result;
-          if (cache.has(cacheKey)) { result = cache.get(cacheKey); }
-          else {
-            attempted++; budget--;
-            try { result = fn(...args); } catch (_) { return; }
-            cache.set(cacheKey, result);
-          }
-          if (typeof result === 'string' || typeof result === 'number' || typeof result === 'boolean') {
-            path2.replaceWith(t.valueToNode(result));
-            inlined++;
-          }
-        },
-      });
-
-      if (inlined > 0) {
-        traverse(ast, { Program(path2) { path2.scope.crawl(); } });
-        traverse(ast, {
-          FunctionDeclaration(path2) {
-            const name = path2.node.id?.name;
-            if (name && candidateNames.has(name)) {
-              const b = path2.scope.getBinding(name);
-              if (b && b.references === 0) path2.remove();
-            }
-          },
-          VariableDeclarator(path2) {
-            if (t.isIdentifier(path2.node.id) && candidateNames.has(path2.node.id.name)) {
-              const b = path2.scope.getBinding(path2.node.id.name);
-              if (b && b.references === 0) {
-                if (path2.parentPath.node.declarations.length === 1) path2.parentPath.remove();
-                else path2.remove();
-              }
-            }
-          },
-        });
-      }
-      log('Executed sandboxed decoder machinery: ' + attempted + ' unique call(s) evaluated, ' + inlined + ' call site(s) inlined');
-    },
-  };
-
-  // ════════════════════════════════════════════════════════════════════════════
-  // PASS 7: STRING ARRAY CLEANUP PASS
-  // ════════════════════════════════════════════════════════════════════════════
-
-  const stringArrayCleanupPass = {
-    id: 'stringArrayCleanup', name: 'Massive String Array Cleanup', priority: 6, enabled: true,
-    run(ast, { log }) {
-      let inlined = 0, arraysRemoved = 0;
-      const candidates = new Map();
-      traverse(ast, {
-        VariableDeclarator(path2) {
-          const { id, init } = path2.node;
-          if (!t.isIdentifier(id) || !t.isArrayExpression(init) || init.elements.length < 2) return;
-          const elements = init.elements.map(el => {
-            if (t.isStringLiteral(el)) return el.value;
-            if (t.isNumericLiteral(el)) return el.value;
-            if (t.isNullLiteral(el)) return null;
-            return undefined;
-          });
-          const sc = elements.filter(e => typeof e === 'string').length;
-          if (sc / elements.length < 0.5 || elements.some(e => e === undefined)) return;
-          candidates.set(id.name, elements);
-        },
-      });
-      if (candidates.size === 0) { log('No large string arrays found'); return; }
-      log('Found ' + candidates.size + ' string array(s): ' + [...candidates.keys()].join(', '));
-      traverse(ast, {
-        MemberExpression(path2) {
-          if (!t.isIdentifier(path2.node.object)) return;
-          const name = path2.node.object.name;
-          if (!candidates.has(name)) return;
-          const arr = candidates.get(name);
-          const idx = resolveIndex(path2.node.property, path2.node.computed);
-          if (idx === null || idx < 0 || idx >= arr.length) return;
-          const val = arr[idx];
-          if (val === null) return;
-          if (typeof val === 'string') { path2.replaceWith(t.stringLiteral(val)); inlined++; }
-          else if (typeof val === 'number') { path2.replaceWith(t.numericLiteral(val)); inlined++; }
-        },
-      });
-      if (inlined > 0) {
-        traverse(ast, {
-          VariableDeclaration(path2) {
-            const prev = path2.node.declarations.length;
-            path2.node.declarations = path2.node.declarations.filter(d => !t.isIdentifier(d.id) || !candidates.has(d.id.name));
-            arraysRemoved += prev - path2.node.declarations.length;
-            if (path2.node.declarations.length === 0) path2.remove();
-          },
-        });
-      }
-      log('Inlined ' + inlined + ' array access(es), removed ' + arraysRemoved + ' array declaration(s)');
-    },
   };
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -1026,13 +519,8 @@ async function bootstrap() {
 
   const reg = new TransformRegistry();
   reg.registerAll([
-    universalDecoderPass,
+    runtimeDecoderPass,
     infiniteLoopRemovalPass,
-    propertyNameDeobfuscationPass,
-    runtimePatternPass,
-    zeroxDecoderPass,
-    sandboxDecoderPass,
-    stringArrayCleanupPass,
   ]);
   
   registry = reg;
