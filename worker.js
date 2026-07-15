@@ -620,6 +620,46 @@ async function bootstrap() {
     }
   };
 
+  // ── Shared helpers ──────────────────────────────────────────────────────
+  // "Obfuscator scaffolding" names: either the classic hex-suffix style
+  // (_0x1a2b) or any identifier containing a character outside printable
+  // ASCII (homoglyphs, invisible joiners/marks, RTL/LTR controls, etc — the
+  // kind of thing no one types by hand into real webgame-script source).
+  // Real, human-authored identifiers are effectively always plain ASCII, so
+  // this lets dead-code cleanup safely reach obfuscated names it couldn't
+  // recognize before, while never touching a legitimately-named variable
+  // just because it happens to go unread later.
+  function isObfuscatorName(name) {
+    return /^_0x[0-9a-f]+$/i.test(name) || /[^\x00-\x7F]/.test(name);
+  }
+
+  // Recognizes expressions that are provably side-effect-free even though
+  // they contain a CallExpression — specifically calls to pure Math.*
+  // methods (common "junk"/decoy computations in this obfuscation style,
+  // e.g. Math.floor(x[x.x]) which always evaluates to NaN) — so long as
+  // every argument is itself side-effect-free.
+  const PURE_MATH_METHODS = new Set([
+    'floor', 'ceil', 'round', 'trunc', 'abs', 'sign', 'min', 'max',
+    'sqrt', 'cbrt', 'pow', 'log', 'log2', 'log10', 'exp', 'random'
+  ]);
+  function isPureExpression(node) {
+    if (!node) return false;
+    if (t.isStringLiteral(node) || t.isNumericLiteral(node) || t.isBooleanLiteral(node) ||
+        t.isNullLiteral(node) || t.isIdentifier(node)) return true;
+    if (t.isMemberExpression(node)) {
+      return isPureExpression(node.object) && (!node.computed || isPureExpression(node.property));
+    }
+    if (t.isCallExpression(node)) {
+      const callee = node.callee;
+      const isMathCall = t.isMemberExpression(callee) && !callee.computed &&
+        t.isIdentifier(callee.object) && callee.object.name === 'Math' &&
+        t.isIdentifier(callee.property) && PURE_MATH_METHODS.has(callee.property.name);
+      if (!isMathCall) return false;
+      return node.arguments.every(isPureExpression);
+    }
+    return false;
+  }
+
   // ════════════════════════════════════════════════════════════════════════════
   // PASS 5: UNUSED DECLARATION REMOVAL
   // Strips decoder/array declarations that become dead once their call sites
@@ -635,12 +675,6 @@ async function bootstrap() {
       let removed = 0;
       let changed = true;
       let iterations = 0;
-
-      // Only ever touch obfuscator-style scaffolding names (e.g. _0x3c4d),
-      // never arbitrary program variables — a variable a human named and
-      // simply doesn't happen to read again later is not "dead code" and
-      // must not be deleted by a deobfuscator.
-      const isObfuscatorName = (name) => /^_0x[0-9a-f]+$/i.test(name);
 
       // Iterate to a fixpoint: removing a decoder can make the array (or
       // another helper) newly-unused too.
@@ -667,7 +701,7 @@ async function bootstrap() {
               t.isArrayExpression(init) || t.isObjectExpression(init) ||
               t.isStringLiteral(init) || t.isNumericLiteral(init) ||
               t.isBooleanLiteral(init) || t.isNullLiteral(init) ||
-              t.isIdentifier(init);
+              t.isIdentifier(init) || isPureExpression(init);
             if (!isSafe) return;
 
             const binding = path.scope.getBinding(id.name);
@@ -849,8 +883,6 @@ async function bootstrap() {
       let removed = 0;
       traverse(ast, { Program(path) { path.scope.crawl(); } });
 
-      const isObfuscatorName = (name) => /^_0x[0-9a-f]+$/i.test(name);
-
       const candidates = new Map();
       traverse(ast, {
         VariableDeclarator(path) {
@@ -902,6 +934,49 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
+  // PASS 9: CONFUSABLE IDENTIFIER RENAMING
+  // Renames homoglyph / invisible-character / mixed-script identifiers
+  // (e.g. "ᅟރо", "с９ᚂ") to clean sequential names (_v0, _v1, ...). Runs last
+  // so every earlier pass — which pattern-matches against the *original*
+  // obfuscator naming — still sees the real names while it works.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const identifierRenamePass = {
+    id: 'identifierRename',
+    name: 'Confusable Identifier Renaming',
+    priority: 9,
+    enabled: true,
+    run(ast, { log }) {
+      traverse(ast, { Program(path) { path.scope.crawl(); } });
+
+      let counter = 0;
+      const renamedBindings = new Set();
+
+      traverse(ast, {
+        Identifier(path) {
+          if (!path.isReferencedIdentifier() && !path.isBindingIdentifier()) return;
+          const name = path.node.name;
+          if (!isObfuscatorName(name)) return;
+
+          const binding = path.scope.getBinding(name);
+          if (!binding || renamedBindings.has(binding)) return;
+          renamedBindings.add(binding);
+
+          let newName;
+          do { newName = '_v' + (counter++); } while (binding.scope.hasBinding(newName));
+          binding.scope.rename(binding.identifier.name, newName);
+        }
+      });
+
+      if (renamedBindings.size > 0) {
+        log('Renamed ' + renamedBindings.size + ' obfuscated identifiers');
+      } else {
+        log('No obfuscated identifiers found');
+      }
+    }
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
   // REGISTER ALL PASSES
   // ════════════════════════════════════════════════════════════════════════════
 
@@ -915,6 +990,7 @@ async function bootstrap() {
     unusedDeclarationPass,
     memberExpressionSimplifyPass,
     arrayRotationCleanupPass,
+    identifierRenamePass,
   ]);
   
   registry = reg;
