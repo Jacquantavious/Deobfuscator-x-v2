@@ -164,28 +164,41 @@ async function bootstrap() {
 
       // ── Step 2: Find decoder functions that reference the arrays ──
       for (const [arrayName, data] of arrayMap) {
+        const inspectFn = (fnPath, name) => {
+          if (!name || data.decoder) return;
+          const body = fnPath.node.body;
+          if (!t.isBlockStatement(body)) return;
+          let refsArray = false;
+          fnPath.traverse({
+            MemberExpression(p) {
+              if (t.isIdentifier(p.node.object) && p.node.object.name === arrayName) {
+                refsArray = true;
+              }
+            }
+          });
+          if (refsArray) {
+            data.decoder = name;
+            log('Found decoder: ' + name + ' for array: ' + arrayName);
+          }
+        };
+
+        const nameFromParent = (parent) => {
+          if (t.isVariableDeclarator(parent) && t.isIdentifier(parent.id)) return parent.id.name;
+          if (t.isAssignmentExpression(parent) && t.isIdentifier(parent.left)) return parent.left.name;
+          return null;
+        };
+
         traverse(ast, {
           FunctionDeclaration(path) {
-            const name = path.node.id?.name;
-            if (!name) return;
-            
-            const body = path.node.body;
-            if (!t.isBlockStatement(body)) return;
-            
-            // Check if this function references the array
-            let refsArray = false;
-            traverse(body, {
-              MemberExpression(p) {
-                if (t.isIdentifier(p.node.object) && p.node.object.name === arrayName) {
-                  refsArray = true;
-                }
-              }
-            });
-            
-            if (refsArray) {
-              data.decoder = name;
-              log('Found decoder: ' + name + ' for array: ' + arrayName);
-            }
+            inspectFn(path, path.node.id?.name);
+          },
+          FunctionExpression(path) {
+            const name = path.node.id?.name || nameFromParent(path.parent);
+            inspectFn(path, name);
+          },
+          ArrowFunctionExpression(path) {
+            if (!t.isBlockStatement(path.node.body)) return;
+            inspectFn(path, nameFromParent(path.parent));
           }
         });
       }
@@ -283,27 +296,37 @@ async function bootstrap() {
       const decoderOffset = 108;
       
       // ── Step 1: Find the string array function ──
-      traverse(ast, {
-        FunctionDeclaration(path) {
-          const name = path.node.id?.name;
-          if (!name || !/^_0x[a-f0-9]+$/i.test(name)) return;
+      const nameFromParent = (parent) => {
+        if (t.isVariableDeclarator(parent) && t.isIdentifier(parent.id)) return parent.id.name;
+        if (t.isAssignmentExpression(parent) && t.isIdentifier(parent.left)) return parent.left.name;
+        return null;
+      };
 
-          const body = path.node.body;
-          if (!t.isBlockStatement(body)) return;
-
-          for (const stmt of body.body) {
-            if (t.isReturnStatement(stmt) && t.isArrayExpression(stmt.argument)) {
-              const elements = stmt.argument.elements
-                .filter(el => t.isStringLiteral(el))
-                .map(el => el.value);
-              if (elements.length > 10) {
-                arrayFunctionName = name;
-                stringArray = elements;
-                log('Found complex string array: ' + name + ' with ' + elements.length + ' entries');
-                return;
-              }
+      const inspectArrayFn = (fnPath, name) => {
+        if (!name || !/^_0x[a-f0-9]+$/i.test(name) || arrayFunctionName) return;
+        const body = fnPath.node.body;
+        if (!t.isBlockStatement(body)) return;
+        for (const stmt of body.body) {
+          if (t.isReturnStatement(stmt) && t.isArrayExpression(stmt.argument)) {
+            const elements = stmt.argument.elements
+              .filter(el => t.isStringLiteral(el))
+              .map(el => el.value);
+            if (elements.length > 10) {
+              arrayFunctionName = name;
+              stringArray = elements;
+              log('Found complex string array: ' + name + ' with ' + elements.length + ' entries');
+              return;
             }
           }
+        }
+      };
+
+      traverse(ast, {
+        FunctionDeclaration(path) {
+          inspectArrayFn(path, path.node.id?.name);
+        },
+        FunctionExpression(path) {
+          inspectArrayFn(path, path.node.id?.name || nameFromParent(path.parent));
         }
       });
 
@@ -313,32 +336,36 @@ async function bootstrap() {
       }
 
       // ── Step 2: Find the decoder function ──
-      traverse(ast, {
-        FunctionDeclaration(path) {
-          const name = path.node.id?.name;
-          if (!name || !/^_0x[a-f0-9]+$/i.test(name) || name === arrayFunctionName) return;
+      const inspectDecoderFn = (fnPath, name) => {
+        if (!name || !/^_0x[a-f0-9]+$/i.test(name) || name === arrayFunctionName || decoderName) return;
+        const body = fnPath.node.body;
+        if (!t.isBlockStatement(body)) return;
 
-          const body = path.node.body;
-          if (!t.isBlockStatement(body)) return;
-
-          // Check if this function references the array
-          let hasArrayRef = false;
-          for (const stmt of body.body) {
-            if (t.isVariableDeclaration(stmt)) {
-              for (const decl of stmt.declarations) {
-                if (t.isCallExpression(decl.init) && 
-                    t.isIdentifier(decl.init.callee) && 
-                    decl.init.callee.name === arrayFunctionName) {
-                  hasArrayRef = true;
-                }
+        let hasArrayRef = false;
+        for (const stmt of body.body) {
+          if (t.isVariableDeclaration(stmt)) {
+            for (const decl of stmt.declarations) {
+              if (t.isCallExpression(decl.init) &&
+                  t.isIdentifier(decl.init.callee) &&
+                  decl.init.callee.name === arrayFunctionName) {
+                hasArrayRef = true;
               }
             }
           }
+        }
 
-          if (hasArrayRef) {
-            decoderName = name;
-            log('Found complex decoder: ' + name);
-          }
+        if (hasArrayRef) {
+          decoderName = name;
+          log('Found complex decoder: ' + name);
+        }
+      };
+
+      traverse(ast, {
+        FunctionDeclaration(path) {
+          inspectDecoderFn(path, path.node.id?.name);
+        },
+        FunctionExpression(path) {
+          inspectDecoderFn(path, path.node.id?.name || nameFromParent(path.parent));
         }
       });
 
@@ -432,31 +459,14 @@ async function bootstrap() {
           const value = path.node.value;
           const raw = path.node.extra?.raw || '';
           
-          // Check for hex escapes like \x68\x65\x6c\x6c\x6f
-          if (raw.includes('\\x')) {
-            try {
-              const unescaped = eval('"' + raw + '"');
-              if (unescaped && isPrintable(unescaped) && unescaped !== value) {
-                // Check if the decoded string is readable
-                if (/^[a-zA-Z0-9\s\-_.,!?]+$/.test(unescaped) || unescaped.includes(' ')) {
-                  path.replaceWith(t.stringLiteral(unescaped));
-                  decodedCount++;
-                }
-              }
-            } catch(_) {}
-          }
-          
-          // Check for Unicode escapes like \u0068
-          if (raw.includes('\\u')) {
-            try {
-              const unescaped = eval('"' + raw + '"');
-              if (unescaped && isPrintable(unescaped) && unescaped !== value) {
-                if (/^[a-zA-Z0-9\s\-_.,!?]+$/.test(unescaped) || unescaped.includes(' ')) {
-                  path.replaceWith(t.stringLiteral(unescaped));
-                  decodedCount++;
-                }
-              }
-            } catch(_) {}
+          // Babel already decodes \x.. / \u.... escapes into `value` at parse time;
+          // the original escaped text is only kept in `extra.raw` for pretty-printing.
+          // Replacing with a fresh StringLiteral (no `extra`) forces the generator to
+          // print the already-decoded value instead of the original escaped source.
+          if ((raw.includes('\\x') || raw.includes('\\u')) && isPrintable(value) && value.length > 0) {
+            path.replaceWith(t.stringLiteral(value));
+            decodedCount++;
+            return;
           }
           
           // Try to decode if it's just hex
@@ -641,6 +651,16 @@ async function bootstrap() {
           }
         },
         
+        ConditionalExpression: {
+          exit(path) {
+            const test = path.node.test;
+            if (t.isBooleanLiteral(test)) {
+              path.replaceWith(test.value ? path.node.consequent : path.node.alternate);
+              folded++;
+            }
+          }
+        },
+
         UnaryExpression: {
           exit(path) {
             const op = path.node.operator;
