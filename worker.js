@@ -586,6 +586,30 @@ async function bootstrap() {
             if (newBody.length < body.length) {
               path.node.body = newBody;
             }
+
+            // Unwrap "bare" blocks left over from collapsing if(true)/if(false)
+            // statements (or already present as unnecessary braces) when it's
+            // safe to splice their statements into the parent: only when the
+            // parent is itself a statement list (Program/BlockStatement) and
+            // the block contains no block-scoped bindings that depend on the
+            // extra scope (let/const/class/function declarations).
+            const parent = path.parent;
+            if (t.isProgram(parent) || t.isBlockStatement(parent)) {
+              const hasBlockScoped = path.node.body.some(stmt =>
+                t.isFunctionDeclaration(stmt) ||
+                t.isClassDeclaration(stmt) ||
+                (t.isVariableDeclaration(stmt) && stmt.kind !== 'var')
+              );
+              if (!hasBlockScoped) {
+                if (path.node.body.length === 0) {
+                  path.remove();
+                  removed++;
+                } else {
+                  path.replaceWithMultiple(path.node.body);
+                  removed++;
+                }
+              }
+            }
           }
         }
       });
@@ -597,7 +621,91 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
-  // PASS 5: CONSTANT FOLDING
+  // PASS 5: UNUSED DECLARATION REMOVAL
+  // Strips decoder/array declarations that become dead once their call sites
+  // have already been replaced with literal values by earlier passes.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const unusedDeclarationPass = {
+    id: 'unusedDeclarations',
+    name: 'Unused Declaration Removal',
+    priority: 6,
+    enabled: true,
+    run(ast, { log }) {
+      let removed = 0;
+      let changed = true;
+      let iterations = 0;
+
+      // Only ever touch obfuscator-style scaffolding names (e.g. _0x3c4d),
+      // never arbitrary program variables — a variable a human named and
+      // simply doesn't happen to read again later is not "dead code" and
+      // must not be deleted by a deobfuscator.
+      const isObfuscatorName = (name) => /^_0x[0-9a-f]+$/i.test(name);
+
+      // Iterate to a fixpoint: removing a decoder can make the array (or
+      // another helper) newly-unused too.
+      while (changed && iterations < 10) {
+        changed = false;
+        iterations++;
+
+        // Earlier passes replaced reference nodes (e.g. decoder calls) with
+        // literals via path.replaceWith, which does not retroactively update
+        // the binding info computed at the last scope crawl. Re-crawl so
+        // `binding.referenced` reflects the AST as it stands right now.
+        traverse(ast, { Program(path) { path.scope.crawl(); } });
+
+        traverse(ast, {
+          VariableDeclarator(path) {
+            const id = path.node.id;
+            const init = path.node.init;
+            if (!t.isIdentifier(id) || !init || !isObfuscatorName(id.name)) return;
+
+            // Only remove declarations whose initializer can't have side
+            // effects, so we never delete something like `var x = fetch()`.
+            const isSafe =
+              t.isFunctionExpression(init) || t.isArrowFunctionExpression(init) ||
+              t.isArrayExpression(init) || t.isObjectExpression(init) ||
+              t.isStringLiteral(init) || t.isNumericLiteral(init) ||
+              t.isBooleanLiteral(init) || t.isNullLiteral(init) ||
+              t.isIdentifier(init);
+            if (!isSafe) return;
+
+            const binding = path.scope.getBinding(id.name);
+            if (!binding || binding.referenced || binding.constantViolations.length) return;
+
+            const declPath = path.parentPath;
+            if (declPath.isVariableDeclaration() && declPath.node.declarations.length === 1) {
+              declPath.remove();
+            } else {
+              path.remove();
+            }
+            removed++;
+            changed = true;
+            log('Removed unused declaration: ' + id.name);
+          },
+          FunctionDeclaration(path) {
+            const id = path.node.id;
+            if (!id || !isObfuscatorName(id.name)) return;
+            const binding = path.scope.getBinding(id.name);
+            if (!binding || binding.referenced) return;
+            path.remove();
+            removed++;
+            changed = true;
+            log('Removed unused function: ' + id.name);
+          }
+        });
+      }
+
+      if (removed > 0) {
+        log('Removed ' + removed + ' unused declarations');
+      } else {
+        log('No unused declarations found');
+      }
+    }
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PASS 6: CONSTANT FOLDING
   // ════════════════════════════════════════════════════════════════════════════
 
   const constantFoldingPass = {
@@ -699,6 +807,7 @@ async function bootstrap() {
     stringDeobfuscationPass,
     deadCodeRemovalPass,
     constantFoldingPass,
+    unusedDeclarationPass,
   ]);
   
   registry = reg;
