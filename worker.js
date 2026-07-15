@@ -797,6 +797,111 @@ async function bootstrap() {
   };
 
   // ════════════════════════════════════════════════════════════════════════════
+  // PASS 7: BRACKET NOTATION SIMPLIFICATION
+  // console['log'](x) -> console.log(x)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+  const RESERVED_WORDS = new Set([
+    'break','case','catch','class','const','continue','debugger','default','delete','do','else',
+    'export','extends','finally','for','function','if','import','in','instanceof','new','return',
+    'super','switch','this','throw','try','typeof','var','void','while','with','yield','let',
+    'static','enum','await','implements','package','protected','interface','private','public',
+    'null','true','false'
+  ]);
+
+  const memberExpressionSimplifyPass = {
+    id: 'memberSimplify',
+    name: 'Bracket Notation Simplification',
+    priority: 7,
+    enabled: true,
+    run(ast, { log }) {
+      let count = 0;
+      traverse(ast, {
+        MemberExpression(path) {
+          const node = path.node;
+          if (!node.computed || !t.isStringLiteral(node.property)) return;
+          const val = node.property.value;
+          if (!IDENTIFIER_RE.test(val) || RESERVED_WORDS.has(val)) return;
+          node.property = t.identifier(val);
+          node.computed = false;
+          count++;
+        }
+      });
+      if (count > 0) log('Converted ' + count + ' bracket accesses to dot notation');
+    }
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PASS 8: ARRAY ROTATION IIFE CLEANUP
+  // Removes the classic javascript-obfuscator "string array shuffle" bootstrap
+  // — (function(arr, count){ ...push/shift...; })(ARRAY, N); — once the array
+  // it rotates has no readers left (i.e. every string was already inlined and
+  // the decoder that indexed into it has already been stripped).
+  // ════════════════════════════════════════════════════════════════════════════
+
+  const arrayRotationCleanupPass = {
+    id: 'arrayRotationCleanup',
+    name: 'Array Rotation IIFE Cleanup',
+    priority: 8,
+    enabled: true,
+    run(ast, { log }) {
+      let removed = 0;
+      traverse(ast, { Program(path) { path.scope.crawl(); } });
+
+      const isObfuscatorName = (name) => /^_0x[0-9a-f]+$/i.test(name);
+
+      const candidates = new Map();
+      traverse(ast, {
+        VariableDeclarator(path) {
+          const id = path.node.id;
+          if (t.isIdentifier(id) && isObfuscatorName(id.name) && t.isArrayExpression(path.node.init)) {
+            candidates.set(id.name, path);
+          }
+        }
+      });
+
+      if (candidates.size === 0) return;
+
+      traverse(ast, {
+        ExpressionStatement(path) {
+          const expr = path.node.expression;
+          if (!t.isCallExpression(expr)) return;
+          const callee = expr.callee;
+          if (!(t.isFunctionExpression(callee) || t.isArrowFunctionExpression(callee))) return;
+          const args = expr.arguments;
+          if (!args.length) return;
+          const firstArg = args[0];
+          if (!t.isIdentifier(firstArg) || !candidates.has(firstArg.name)) return;
+
+          const arrayName = firstArg.name;
+          const binding = path.scope.getBinding(arrayName);
+          if (!binding) return;
+
+          // Only safe to delete if this argument is the ONLY remaining read
+          // of the array anywhere in the program.
+          const hasOtherReferences = binding.referencePaths.some((refPath) => refPath.node !== firstArg);
+          if (hasOtherReferences) return;
+
+          const arrayDeclPath = candidates.get(arrayName);
+          path.remove();
+          const declStmt = arrayDeclPath.parentPath;
+          if (declStmt.isVariableDeclaration() && declStmt.node.declarations.length === 1) {
+            declStmt.remove();
+          } else {
+            arrayDeclPath.remove();
+          }
+          candidates.delete(arrayName);
+          removed++;
+          log('Removed dead array-rotation bootstrap for: ' + arrayName);
+        }
+      });
+
+      if (removed > 0) log('Removed ' + removed + ' array-rotation IIFE(s)');
+    }
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
   // REGISTER ALL PASSES
   // ════════════════════════════════════════════════════════════════════════════
 
@@ -808,6 +913,8 @@ async function bootstrap() {
     deadCodeRemovalPass,
     constantFoldingPass,
     unusedDeclarationPass,
+    memberExpressionSimplifyPass,
+    arrayRotationCleanupPass,
   ]);
   
   registry = reg;
